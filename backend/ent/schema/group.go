@@ -150,6 +150,12 @@ func (Group) Fields() []ent.Field {
 		field.Int("rpm_limit").
 			Default(0).
 			Comment("分组 RPM 上限，0 表示不限制；设置后接管该分组用户的限流"),
+
+		// Codex upstream service_tier override (OpenAI OAuth/Codex only).
+		field.String("codex_service_tier_mode").
+			MaxLen(32).
+			Default("follow_upstream").
+			Comment("Codex service_tier 覆盖策略：follow_upstream / force_fast / disallow_fast"),
 	}
 }
 

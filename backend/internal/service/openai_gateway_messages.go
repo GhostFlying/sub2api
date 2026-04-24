@@ -112,6 +112,10 @@ func (s *OpenAIGatewayService) ForwardAsAnthropic(
 		} else if promptCacheKey != "" {
 			reqBody["prompt_cache_key"] = promptCacheKey
 		}
+		// Anthropic Messages compatibility reaches OpenAI as a Responses
+		// request, so the same group service_tier policy applies here.
+		applyCodexServiceTierOverrideToRequestMap(reqBody, s.resolveCodexServiceTierOverrideMode(ctx, c, account))
+		responsesReq.ServiceTier = normalizedOpenAIServiceTierValue(fmt.Sprintf("%v", reqBody["service_tier"]))
 		// OAuth codex transform forces stream=true upstream, so always use
 		// the streaming response handler regardless of what the client asked.
 		isStream = true

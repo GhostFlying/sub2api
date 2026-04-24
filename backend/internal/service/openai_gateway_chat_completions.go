@@ -165,10 +165,14 @@ func (s *OpenAIGatewayService) ForwardAsChatCompletions(
 		} else if promptCacheKey != "" {
 			reqBody["prompt_cache_key"] = promptCacheKey
 		}
+		// Compatibility requests are converted to Responses first; apply the
+		// group service_tier policy to that Responses-shaped map.
+		applyCodexServiceTierOverrideToRequestMap(reqBody, s.resolveCodexServiceTierOverrideMode(ctx, c, account))
 		responsesBody, err = json.Marshal(reqBody)
 		if err != nil {
 			return nil, fmt.Errorf("remarshal after codex transform: %w", err)
 		}
+		responsesReq.ServiceTier = normalizedOpenAIServiceTierValue(fmt.Sprintf("%v", reqBody["service_tier"]))
 	}
 
 	// 5. Get access token

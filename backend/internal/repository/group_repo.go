@@ -79,6 +79,11 @@ func (r *groupRepository) Create(ctx context.Context, groupIn *service.Group) er
 		groupIn.ID = created.ID
 		groupIn.CreatedAt = created.CreatedAt
 		groupIn.UpdatedAt = created.UpdatedAt
+		// Keep the new column write isolated while generated ent setters are not
+		// refreshed in this branch; the field still belongs to groups.
+		if err := r.setGroupCodexServiceTierMode(ctx, groupIn.ID, groupIn.CodexServiceTierMode); err != nil {
+			return err
+		}
 		if err := enqueueSchedulerOutbox(ctx, r.sql, service.SchedulerOutboxEventGroupChanged, nil, &groupIn.ID, nil); err != nil {
 			logger.LegacyPrintf("repository.group", "[SchedulerOutbox] enqueue group create failed: group=%d err=%v", groupIn.ID, err)
 		}
@@ -94,6 +99,7 @@ func (r *groupRepository) GetByID(ctx context.Context, id int64) (*service.Group
 	total, active, _ := r.GetAccountCount(ctx, out.ID)
 	out.AccountCount = total
 	out.ActiveAccountCount = active
+	_ = r.loadGroupCodexServiceTierMode(ctx, out)
 	return out, nil
 }
 
@@ -194,6 +200,11 @@ func (r *groupRepository) Update(ctx context.Context, groupIn *service.Group) er
 		return translatePersistenceError(err, service.ErrGroupNotFound, service.ErrGroupExists)
 	}
 	groupIn.UpdatedAt = updated.UpdatedAt
+	// Keep the new column write isolated while generated ent setters are not
+	// refreshed in this branch; the field still belongs to groups.
+	if err := r.setGroupCodexServiceTierMode(ctx, groupIn.ID, groupIn.CodexServiceTierMode); err != nil {
+		return err
+	}
 	if err := enqueueSchedulerOutbox(ctx, r.sql, service.SchedulerOutboxEventGroupChanged, nil, &groupIn.ID, nil); err != nil {
 		logger.LegacyPrintf("repository.group", "[SchedulerOutbox] enqueue group update failed: group=%d err=%v", groupIn.ID, err)
 	}
@@ -272,6 +283,13 @@ func (r *groupRepository) ListWithFilters(ctx context.Context, params pagination
 			outGroups[i].RateLimitedAccountCount = c.RateLimited
 		}
 	}
+	// ent's generated Group model in this branch does not expose the new column,
+	// so list responses hydrate it in batch to avoid N+1 reads.
+	if modes, err := r.loadGroupCodexServiceTierModes(ctx, groupIDs); err == nil {
+		for i := range outGroups {
+			outGroups[i].CodexServiceTierMode = modes[outGroups[i].ID]
+		}
+	}
 
 	return outGroups, paginationResultFromTotal(int64(total), params), nil
 }
@@ -301,6 +319,13 @@ func (r *groupRepository) listWithAccountCountSort(ctx context.Context, q *dbent
 		outGroups[i].AccountCount = c.Total
 		outGroups[i].ActiveAccountCount = c.Active
 		outGroups[i].RateLimitedAccountCount = c.RateLimited
+	}
+	// ent's generated Group model in this branch does not expose the new column,
+	// so list responses hydrate it in batch to avoid N+1 reads.
+	if modes, err := r.loadGroupCodexServiceTierModes(ctx, groupIDs); err == nil {
+		for i := range outGroups {
+			outGroups[i].CodexServiceTierMode = modes[outGroups[i].ID]
+		}
 	}
 
 	sortOrder := params.NormalizedSortOrder(pagination.SortOrderDesc)
@@ -400,6 +425,13 @@ func (r *groupRepository) ListActive(ctx context.Context) ([]service.Group, erro
 			outGroups[i].RateLimitedAccountCount = c.RateLimited
 		}
 	}
+	// ent's generated Group model in this branch does not expose the new column,
+	// so list responses hydrate it in batch to avoid N+1 reads.
+	if modes, err := r.loadGroupCodexServiceTierModes(ctx, groupIDs); err == nil {
+		for i := range outGroups {
+			outGroups[i].CodexServiceTierMode = modes[outGroups[i].ID]
+		}
+	}
 
 	return outGroups, nil
 }
@@ -428,6 +460,13 @@ func (r *groupRepository) ListActiveByPlatform(ctx context.Context, platform str
 			outGroups[i].AccountCount = c.Total
 			outGroups[i].ActiveAccountCount = c.Active
 			outGroups[i].RateLimitedAccountCount = c.RateLimited
+		}
+	}
+	// ent's generated Group model in this branch does not expose the new column,
+	// so list responses hydrate it in batch to avoid N+1 reads.
+	if modes, err := r.loadGroupCodexServiceTierModes(ctx, groupIDs); err == nil {
+		for i := range outGroups {
+			outGroups[i].CodexServiceTierMode = modes[outGroups[i].ID]
 		}
 	}
 
@@ -500,6 +539,81 @@ func (r *groupRepository) GetAccountCount(ctx context.Context, groupID int64) (t
 		WHERE ag.group_id = $1`,
 		[]any{groupID}, &total, &active, &rateLimited)
 	return
+}
+
+func (r *groupRepository) setGroupCodexServiceTierMode(ctx context.Context, groupID int64, mode string) error {
+	if r == nil || r.sql == nil || groupID <= 0 {
+		return nil
+	}
+	normalized := service.CodexServiceTierModeFollowUpstream
+	if mode != "" {
+		normalized = (&service.Group{CodexServiceTierMode: mode}).CodexServiceTierOverrideMode()
+	}
+	_, err := r.sql.ExecContext(ctx, `
+		UPDATE groups
+		SET codex_service_tier_mode = $1
+		WHERE id = $2
+	`, normalized, groupID)
+	return err
+}
+
+func (r *groupRepository) loadGroupCodexServiceTierMode(ctx context.Context, out *service.Group) error {
+	if r == nil {
+		return nil
+	}
+	return hydrateGroupCodexServiceTierMode(ctx, r.sql, out)
+}
+
+// hydrateGroupCodexServiceTierMode is a temporary raw-SQL bridge for the new
+// groups.codex_service_tier_mode column until generated ent Group accessors are
+// refreshed. It hydrates a Group object only; it does not add key-level policy.
+func hydrateGroupCodexServiceTierMode(ctx context.Context, q sqlQueryer, out *service.Group) error {
+	if q == nil || out == nil || out.ID <= 0 {
+		return nil
+	}
+	var mode sql.NullString
+	if err := scanSingleRow(ctx, q, `
+		SELECT codex_service_tier_mode
+		FROM groups
+		WHERE id = $1 AND deleted_at IS NULL
+	`, []any{out.ID}, &mode); err != nil {
+		return err
+	}
+	if mode.Valid {
+		out.CodexServiceTierMode = mode.String
+	}
+	return nil
+}
+
+func (r *groupRepository) loadGroupCodexServiceTierModes(ctx context.Context, groupIDs []int64) (map[int64]string, error) {
+	modes := make(map[int64]string, len(groupIDs))
+	if r == nil || r.sql == nil || len(groupIDs) == 0 {
+		return modes, nil
+	}
+	rows, err := r.sql.QueryContext(ctx, `
+		SELECT id, codex_service_tier_mode
+		FROM groups
+		WHERE id = ANY($1) AND deleted_at IS NULL
+	`, pq.Array(groupIDs))
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	for rows.Next() {
+		var id int64
+		var mode sql.NullString
+		if err := rows.Scan(&id, &mode); err != nil {
+			return nil, err
+		}
+		if mode.Valid {
+			modes[id] = mode.String
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return modes, nil
 }
 
 func (r *groupRepository) DeleteAccountGroupsByGroupID(ctx context.Context, groupID int64) (int64, error) {

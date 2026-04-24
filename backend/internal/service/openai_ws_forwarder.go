@@ -2365,6 +2365,14 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 	if strings.TrimSpace(token) == "" {
 		return errors.New("token is empty")
 	}
+	serviceTierMode := s.resolveCodexServiceTierOverrideMode(ctx, c, account)
+	// The first WS frame may be forwarded before the normal parser loop sees
+	// it, so enforce the group policy before routing the connection.
+	if rewrittenFirstMessage, changed, err := applyCodexServiceTierOverrideToJSONBody(firstClientMessage, serviceTierMode); err != nil {
+		return err
+	} else if changed {
+		firstClientMessage = rewrittenFirstMessage
+	}
 
 	wsDecision := s.getOpenAIWSProtocolResolver().Resolve(account)
 	modeRouterV2Enabled := s != nil && s.cfg != nil && s.cfg.Gateway.OpenAIWS.ModeRouterV2Enabled
@@ -2514,6 +2522,13 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				return openAIWSClientPayload{}, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket request payload", setErr)
 			}
 			normalized = next
+		}
+		// Later WS payloads are raw JSON frames. Rewrite only response.create
+		// frames; the helper intentionally leaves session/control frames alone.
+		if rewritten, changed, rewriteErr := applyCodexServiceTierOverrideToJSONBody(normalized, serviceTierMode); rewriteErr != nil {
+			return openAIWSClientPayload{}, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket request payload", rewriteErr)
+		} else if changed {
+			normalized = rewritten
 		}
 		upstreamModel := normalizeOpenAIModelForUpstream(account, account.GetMappedModel(originalModel))
 		if upstreamModel != originalModel {

@@ -21,6 +21,11 @@ type openAIWSClientFrameConn struct {
 	conn *coderws.Conn
 }
 
+type openAIWSCodexServiceTierFrameConn struct {
+	inner openaiwsv2.FrameConn
+	mode  string
+}
+
 const openaiWSV2PassthroughModeFields = "ws_mode=passthrough ws_router=v2"
 
 var _ openaiwsv2.FrameConn = (*openAIWSClientFrameConn)(nil)
@@ -43,6 +48,37 @@ func (c *openAIWSClientFrameConn) WriteFrame(ctx context.Context, msgType coderw
 		ctx = context.Background()
 	}
 	return c.conn.Write(ctx, msgType, payload)
+}
+
+func (c *openAIWSCodexServiceTierFrameConn) ReadFrame(ctx context.Context) (coderws.MessageType, []byte, error) {
+	if c == nil || c.inner == nil {
+		return coderws.MessageText, nil, errOpenAIWSConnClosed
+	}
+	msgType, payload, err := c.inner.ReadFrame(ctx)
+	if err != nil {
+		return msgType, payload, err
+	}
+	// Passthrough mode streams raw client frames, so rewrite JSON bytes at the
+	// frame boundary instead of decoding into a Responses struct.
+	rewritten, _, rewriteErr := applyCodexServiceTierOverrideToJSONBody(payload, c.mode)
+	if rewriteErr != nil {
+		return msgType, payload, rewriteErr
+	}
+	return msgType, rewritten, nil
+}
+
+func (c *openAIWSCodexServiceTierFrameConn) WriteFrame(ctx context.Context, msgType coderws.MessageType, payload []byte) error {
+	if c == nil || c.inner == nil {
+		return errOpenAIWSConnClosed
+	}
+	return c.inner.WriteFrame(ctx, msgType, payload)
+}
+
+func (c *openAIWSCodexServiceTierFrameConn) Close() error {
+	if c == nil || c.inner == nil {
+		return nil
+	}
+	return c.inner.Close()
 }
 
 func (c *openAIWSClientFrameConn) Close() error {
@@ -75,6 +111,14 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 	}
 	if strings.TrimSpace(token) == "" {
 		return errors.New("token is empty")
+	}
+	serviceTierMode := s.resolveCodexServiceTierOverrideMode(ctx, c, account)
+	// Rewrite the initial response.create frame before logging/routing so the
+	// observed request tier matches what will be sent upstream.
+	if rewrittenFirstMessage, changed, err := applyCodexServiceTierOverrideToJSONBody(firstClientMessage, serviceTierMode); err != nil {
+		return err
+	} else if changed {
+		firstClientMessage = rewrittenFirstMessage
 	}
 	requestModel := strings.TrimSpace(gjson.GetBytes(firstClientMessage, "model").String())
 	requestServiceTier := extractOpenAIServiceTierFromBody(firstClientMessage)
@@ -153,8 +197,11 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 
 	completedTurns := atomic.Int32{}
 	relayResult, relayExit := openaiwsv2.RunEntry(openaiwsv2.EntryInput{
-		Ctx:                ctx,
-		ClientConn:         &openAIWSClientFrameConn{conn: clientConn},
+		Ctx: ctx,
+		ClientConn: &openAIWSCodexServiceTierFrameConn{
+			inner: &openAIWSClientFrameConn{conn: clientConn},
+			mode:  serviceTierMode,
+		},
 		UpstreamConn:       upstreamFrameConn,
 		FirstClientMessage: firstClientMessage,
 		Options: openaiwsv2.RelayOptions{

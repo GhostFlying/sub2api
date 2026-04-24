@@ -204,6 +204,7 @@ type CreateGroupInput struct {
 	DefaultMappedModel          string
 	RequireOAuthOnly            bool
 	RequirePrivacySet           bool
+	CodexServiceTierMode        string
 	MessagesDispatchModelConfig OpenAIMessagesDispatchModelConfig
 	// RPMLimit 分组 RPM 上限（0 = 不限制）
 	RPMLimit int
@@ -241,6 +242,7 @@ type UpdateGroupInput struct {
 	DefaultMappedModel          *string
 	RequireOAuthOnly            *bool
 	RequirePrivacySet           *bool
+	CodexServiceTierMode        *string
 	MessagesDispatchModelConfig *OpenAIMessagesDispatchModelConfig
 	// RPMLimit 分组 RPM 上限（0 = 不限制），nil 表示未提供不改动。
 	RPMLimit *int
@@ -1426,11 +1428,13 @@ func (s *adminServiceImpl) CreateGroup(ctx context.Context, input *CreateGroupIn
 		AllowMessagesDispatch:           input.AllowMessagesDispatch,
 		RequireOAuthOnly:                input.RequireOAuthOnly,
 		RequirePrivacySet:               input.RequirePrivacySet,
+		CodexServiceTierMode:            normalizeCodexServiceTierMode(input.CodexServiceTierMode),
 		DefaultMappedModel:              input.DefaultMappedModel,
 		MessagesDispatchModelConfig:     normalizeOpenAIMessagesDispatchModelConfig(input.MessagesDispatchModelConfig),
 		RPMLimit:                        input.RPMLimit,
 	}
 	sanitizeGroupMessagesDispatchFields(group)
+	sanitizeGroupCodexServiceTierFields(group)
 	if err := s.groupRepo.Create(ctx, group); err != nil {
 		return nil, err
 	}
@@ -1657,6 +1661,9 @@ func (s *adminServiceImpl) UpdateGroup(ctx context.Context, id int64, input *Upd
 	if input.RequirePrivacySet != nil {
 		group.RequirePrivacySet = *input.RequirePrivacySet
 	}
+	if input.CodexServiceTierMode != nil {
+		group.CodexServiceTierMode = normalizeCodexServiceTierMode(*input.CodexServiceTierMode)
+	}
 	if input.DefaultMappedModel != nil {
 		group.DefaultMappedModel = *input.DefaultMappedModel
 	}
@@ -1667,6 +1674,7 @@ func (s *adminServiceImpl) UpdateGroup(ctx context.Context, id int64, input *Upd
 		group.RPMLimit = *input.RPMLimit
 	}
 	sanitizeGroupMessagesDispatchFields(group)
+	sanitizeGroupCodexServiceTierFields(group)
 
 	if err := s.groupRepo.Update(ctx, group); err != nil {
 		return nil, err

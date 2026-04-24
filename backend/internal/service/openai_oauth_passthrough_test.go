@@ -22,6 +22,8 @@ import (
 
 func f64p(v float64) *float64 { return &v }
 
+func codexTierStringPtr(v string) *string { return &v }
+
 type httpUpstreamRecorder struct {
 	lastReq  *http.Request
 	lastBody []byte
@@ -878,6 +880,109 @@ func TestOpenAIGatewayService_OAuthPassthrough_StreamingSetsFirstTokenMs(t *test
 	require.GreaterOrEqual(t, *result.FirstTokenMs, 0)
 	require.NotNil(t, result.ServiceTier)
 	require.Equal(t, "priority", *result.ServiceTier)
+}
+
+func TestOpenAIGatewayService_OAuthPassthrough_CodexServiceTierOverride(t *testing.T) {
+	tests := []struct {
+		name               string
+		mode               string
+		body               string
+		wantUpstreamExists bool
+		wantUpstreamTier   string
+		wantResultTier     *string
+	}{
+		{
+			name:               "force fast sets priority",
+			mode:               CodexServiceTierModeForceFast,
+			body:               `{"model":"gpt-5.2","stream":true,"input":[{"type":"text","text":"hi"}]}`,
+			wantUpstreamExists: true,
+			wantUpstreamTier:   "priority",
+			wantResultTier:     codexTierStringPtr("priority"),
+		},
+		{
+			name:               "disallow fast removes fast",
+			mode:               CodexServiceTierModeDisallowFast,
+			body:               `{"model":"gpt-5.2","stream":true,"service_tier":"fast","input":[{"type":"text","text":"hi"}]}`,
+			wantUpstreamExists: false,
+			wantResultTier:     nil,
+		},
+		{
+			name:               "disallow fast preserves flex",
+			mode:               CodexServiceTierModeDisallowFast,
+			body:               `{"model":"gpt-5.2","stream":true,"service_tier":"flex","input":[{"type":"text","text":"hi"}]}`,
+			wantUpstreamExists: true,
+			wantUpstreamTier:   "flex",
+			wantResultTier:     codexTierStringPtr("flex"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gin.SetMode(gin.TestMode)
+
+			rec := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(rec)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(nil))
+			c.Request.Header.Set("User-Agent", "codex_cli_rs/0.1.0")
+			gid := int64(10)
+			c.Set("api_key", &APIKey{
+				ID:      1,
+				GroupID: &gid,
+				Group: &Group{
+					ID:                   gid,
+					Platform:             PlatformOpenAI,
+					Status:               StatusActive,
+					Hydrated:             true,
+					CodexServiceTierMode: tt.mode,
+				},
+			})
+
+			upstreamSSE := strings.Join([]string{
+				`data: {"type":"response.output_text.delta","delta":"h"}`,
+				"",
+				"data: [DONE]",
+				"",
+			}, "\n")
+			upstream := &httpUpstreamRecorder{resp: &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}, "x-request-id": []string{"rid"}},
+				Body:       io.NopCloser(strings.NewReader(upstreamSSE)),
+			}}
+			svc := &OpenAIGatewayService{
+				cfg:          &config.Config{Gateway: config.GatewayConfig{ForceCodexCLI: false}},
+				httpUpstream: upstream,
+			}
+
+			account := &Account{
+				ID:             123,
+				Name:           "acc",
+				Platform:       PlatformOpenAI,
+				Type:           AccountTypeOAuth,
+				Concurrency:    1,
+				Credentials:    map[string]any{"access_token": "oauth-token", "chatgpt_account_id": "chatgpt-acc"},
+				Extra:          map[string]any{"openai_passthrough": true},
+				Status:         StatusActive,
+				Schedulable:    true,
+				RateMultiplier: f64p(1),
+			}
+
+			result, err := svc.Forward(context.Background(), c, account, []byte(tt.body))
+			require.NoError(t, err)
+			require.NotNil(t, result)
+			require.NotNil(t, upstream.lastReq)
+			tier := gjson.GetBytes(upstream.lastBody, "service_tier")
+			require.Equal(t, tt.wantUpstreamExists, tier.Exists())
+			if tt.wantUpstreamExists {
+				require.Equal(t, tt.wantUpstreamTier, tier.String())
+			}
+			if tt.wantResultTier == nil {
+				require.Nil(t, result.ServiceTier)
+			} else {
+				require.NotNil(t, result.ServiceTier)
+				require.Equal(t, *tt.wantResultTier, *result.ServiceTier)
+			}
+		})
+	}
 }
 
 func TestOpenAIGatewayService_OAuthPassthrough_StreamClientDisconnectStillCollectsUsage(t *testing.T) {

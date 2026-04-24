@@ -444,6 +444,8 @@ export type GroupPlatform = 'anthropic' | 'openai' | 'gemini' | 'antigravity'
 
 export type SubscriptionType = 'standard' | 'subscription'
 
+export type CodexServiceTierMode = 'follow_upstream' | 'force_fast' | 'disallow_fast'
+
 export interface OpenAIMessagesDispatchModelConfig {
   opus_mapped_model?: string
   sonnet_mapped_model?: string
@@ -501,6 +503,7 @@ export interface AdminGroup extends Group {
   // OpenAI Messages 调度配置（仅 openai 平台使用）
   default_mapped_model?: string
   messages_dispatch_model_config?: OpenAIMessagesDispatchModelConfig
+  codex_service_tier_mode?: CodexServiceTierMode
 
   // 分组排序
   sort_order: number
@@ -584,6 +587,7 @@ export interface CreateGroupRequest {
   supported_model_scopes?: string[]
   require_oauth_only?: boolean
   require_privacy_set?: boolean
+  codex_service_tier_mode?: CodexServiceTierMode
   // 从指定分组复制账号
   copy_accounts_from_group_ids?: number[]
 }
@@ -609,6 +613,7 @@ export interface UpdateGroupRequest {
   supported_model_scopes?: string[]
   require_oauth_only?: boolean
   require_privacy_set?: boolean
+  codex_service_tier_mode?: CodexServiceTierMode
   copy_accounts_from_group_ids?: number[]
 }
 

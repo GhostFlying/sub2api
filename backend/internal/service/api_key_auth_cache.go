@@ -80,7 +80,10 @@ type APIKeyAuthGroupSnapshot struct {
 	SupportedModelScopes []string `json:"supported_model_scopes,omitempty"`
 
 	// OpenAI Messages 调度配置（仅 openai 平台使用）
-	AllowMessagesDispatch       bool                              `json:"allow_messages_dispatch"`
+	AllowMessagesDispatch bool `json:"allow_messages_dispatch"`
+	// Group-owned Codex policy must be cached with auth data because request
+	// rewriting runs after API key auth and should not hit the database again.
+	CodexServiceTierMode        string                            `json:"codex_service_tier_mode,omitempty"`
 	DefaultMappedModel          string                            `json:"default_mapped_model,omitempty"`
 	MessagesDispatchModelConfig OpenAIMessagesDispatchModelConfig `json:"messages_dispatch_model_config,omitempty"`
 

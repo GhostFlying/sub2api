@@ -2041,6 +2041,12 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			promptCacheKey = codexResult.PromptCacheKey
 		}
 	}
+	// Normal Responses forwarding already works with a decoded request map,
+	// so apply the group policy before the body is marshaled back.
+	if mode := s.resolveCodexServiceTierOverrideMode(ctx, c, account); applyCodexServiceTierOverrideToRequestMap(reqBody, mode) {
+		bodyModified = true
+		disablePatch()
+	}
 
 	// Handle max_output_tokens based on platform and account type
 	if !isCodexCLI {
@@ -2534,6 +2540,15 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 		}
 		if normalized {
 			body = normalizedBody
+		}
+		// OAuth passthrough keeps the raw client JSON shape; rewrite the bytes
+		// directly so unknown-but-valid upstream fields are preserved.
+		serviceTierBody, serviceTierChanged, err := applyCodexServiceTierOverrideToJSONBody(body, s.resolveCodexServiceTierOverrideMode(ctx, c, account))
+		if err != nil {
+			return nil, err
+		}
+		if serviceTierChanged {
+			body = serviceTierBody
 		}
 		reqStream = gjson.GetBytes(body, "stream").Bool()
 	}

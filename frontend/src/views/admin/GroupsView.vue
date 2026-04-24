@@ -1137,6 +1137,21 @@
           </div>
         </div>
 
+        <!-- Codex service_tier override（仅 openai 平台） -->
+        <div
+          v-if="createForm.platform === 'openai'"
+          class="border-t border-gray-200 dark:border-dark-400 pt-4 mt-4"
+        >
+          <label class="input-label">Codex Service Tier</label>
+          <Select
+            v-model="createForm.codex_service_tier_mode"
+            :options="codexServiceTierOptions"
+          />
+          <p class="input-hint">
+            Override service_tier for Codex requests using this group.
+          </p>
+        </div>
+
         <!-- 账号过滤控制 (OpenAI/Antigravity/Anthropic/Gemini) -->
         <div
           v-if="
@@ -2268,6 +2283,21 @@
           </div>
         </div>
 
+        <!-- Codex service_tier override（仅 openai 平台） -->
+        <div
+          v-if="editForm.platform === 'openai'"
+          class="border-t border-gray-200 dark:border-dark-400 pt-4 mt-4"
+        >
+          <label class="input-label">Codex Service Tier</label>
+          <Select
+            v-model="editForm.codex_service_tier_mode"
+            :options="codexServiceTierOptions"
+          />
+          <p class="input-hint">
+            Override service_tier for Codex requests using this group.
+          </p>
+        </div>
+
         <!-- 账号过滤控制 (OpenAI/Antigravity/Anthropic/Gemini) -->
         <div
           v-if="
@@ -2739,7 +2769,12 @@ import { useI18n } from "vue-i18n";
 import { useAppStore } from "@/stores/app";
 import { useOnboardingStore } from "@/stores/onboarding";
 import { adminAPI } from "@/api/admin";
-import type { AdminGroup, GroupPlatform, SubscriptionType } from "@/types";
+import type {
+  AdminGroup,
+  CodexServiceTierMode,
+  GroupPlatform,
+  SubscriptionType,
+} from "@/types";
 import type { Column } from "@/components/common/types";
 import AppLayout from "@/components/layout/AppLayout.vue";
 import TablePageLayout from "@/components/layout/TablePageLayout.vue";
@@ -2833,6 +2868,13 @@ const platformFilterOptions = computed(() => [
   { value: "openai", label: "OpenAI" },
   { value: "gemini", label: "Gemini" },
   { value: "antigravity", label: "Antigravity" },
+]);
+
+const codexServiceTierOptions = computed(() => [
+  // Stored on OpenAI groups only; non-OpenAI platforms reset to follow_upstream.
+  { value: "follow_upstream", label: "Follow upstream" },
+  { value: "force_fast", label: "Force fast" },
+  { value: "disallow_fast", label: "Disallow fast" },
 ]);
 
 const editStatusOptions = computed(() => [
@@ -3019,6 +3061,7 @@ const createForm = reactive({
   fallback_group_id_on_invalid_request: null as number | null,
   // OpenAI Messages 调度配置（仅 openai 平台使用）
   allow_messages_dispatch: false,
+  codex_service_tier_mode: "follow_upstream" as CodexServiceTierMode,
   opus_mapped_model: createMessagesDispatchDefaults.opus_mapped_model,
   sonnet_mapped_model: createMessagesDispatchDefaults.sonnet_mapped_model,
   haiku_mapped_model: createMessagesDispatchDefaults.haiku_mapped_model,
@@ -3301,6 +3344,7 @@ const editForm = reactive({
   fallback_group_id_on_invalid_request: null as number | null,
   // OpenAI Messages 调度配置（仅 openai 平台使用）
   allow_messages_dispatch: false,
+  codex_service_tier_mode: "follow_upstream" as CodexServiceTierMode,
   default_mapped_model: '',
   opus_mapped_model: editMessagesDispatchDefaults.opus_mapped_model,
   sonnet_mapped_model: editMessagesDispatchDefaults.sonnet_mapped_model,
@@ -3486,6 +3530,7 @@ const closeCreateModal = () => {
   createForm.fallback_group_id = null;
   createForm.fallback_group_id_on_invalid_request = null;
   resetMessagesDispatchFormState(createForm);
+  createForm.codex_service_tier_mode = "follow_upstream";
   createForm.require_oauth_only = false;
   createForm.require_privacy_set = false;
   createForm.supported_model_scopes = ["claude", "gemini_text", "gemini_image"];
@@ -3595,6 +3640,8 @@ const handleEdit = async (group: AdminGroup) => {
   editForm.allow_messages_dispatch =
     group.allow_messages_dispatch ||
     messagesDispatchFormState.allow_messages_dispatch;
+  editForm.codex_service_tier_mode =
+    group.codex_service_tier_mode || "follow_upstream";
   editForm.opus_mapped_model = messagesDispatchFormState.opus_mapped_model;
   editForm.sonnet_mapped_model = messagesDispatchFormState.sonnet_mapped_model;
   editForm.haiku_mapped_model = messagesDispatchFormState.haiku_mapped_model;
@@ -3764,7 +3811,9 @@ watch(
       createForm.fallback_group_id_on_invalid_request = null;
     }
     if (newVal !== "openai") {
+      // OpenAI-only knobs must not persist when a form switches platform.
       resetMessagesDispatchFormState(createForm);
+      createForm.codex_service_tier_mode = "follow_upstream";
     }
     if (!["openai", "antigravity", "anthropic", "gemini"].includes(newVal)) {
       createForm.require_oauth_only = false;
@@ -3780,7 +3829,9 @@ watch(
       editForm.fallback_group_id_on_invalid_request = null;
     }
     if (newVal !== "openai") {
+      // OpenAI-only knobs must not persist when a form switches platform.
       resetMessagesDispatchFormState(editForm);
+      editForm.codex_service_tier_mode = "follow_upstream";
     }
     if (!["openai", "antigravity", "anthropic", "gemini"].includes(newVal)) {
       editForm.require_oauth_only = false;

@@ -374,6 +374,23 @@ func TestAdminService_CreateGroup_ClearsMessagesDispatchFieldsForNonOpenAIPlatfo
 	require.Equal(t, OpenAIMessagesDispatchModelConfig{}, repo.created.MessagesDispatchModelConfig)
 }
 
+func TestAdminService_CreateGroup_ClearsCodexServiceTierForNonOpenAIPlatform(t *testing.T) {
+	repo := &groupRepoStubForAdmin{}
+	svc := &adminServiceImpl{groupRepo: repo}
+
+	group, err := svc.CreateGroup(context.Background(), &CreateGroupInput{
+		Name:                 "anthropic-group",
+		Description:          "non-openai",
+		Platform:             PlatformAnthropic,
+		RateMultiplier:       1.0,
+		CodexServiceTierMode: CodexServiceTierModeForceFast,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, group)
+	require.NotNil(t, repo.created)
+	require.Equal(t, CodexServiceTierModeFollowUpstream, repo.created.CodexServiceTierMode)
+}
+
 func TestAdminService_UpdateGroup_ClearsMessagesDispatchFieldsWhenPlatformChangesAwayFromOpenAI(t *testing.T) {
 	existingGroup := &Group{
 		ID:                    1,
@@ -399,6 +416,27 @@ func TestAdminService_UpdateGroup_ClearsMessagesDispatchFieldsWhenPlatformChange
 	require.False(t, repo.updated.AllowMessagesDispatch)
 	require.Empty(t, repo.updated.DefaultMappedModel)
 	require.Equal(t, OpenAIMessagesDispatchModelConfig{}, repo.updated.MessagesDispatchModelConfig)
+}
+
+func TestAdminService_UpdateGroup_ClearsCodexServiceTierWhenPlatformChangesAwayFromOpenAI(t *testing.T) {
+	existingGroup := &Group{
+		ID:                   1,
+		Name:                 "existing-openai-group",
+		Platform:             PlatformOpenAI,
+		Status:               StatusActive,
+		CodexServiceTierMode: CodexServiceTierModeForceFast,
+	}
+	repo := &groupRepoStubForAdmin{getByID: existingGroup}
+	svc := &adminServiceImpl{groupRepo: repo}
+
+	group, err := svc.UpdateGroup(context.Background(), 1, &UpdateGroupInput{
+		Platform: PlatformAnthropic,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, group)
+	require.NotNil(t, repo.updated)
+	require.Equal(t, PlatformAnthropic, repo.updated.Platform)
+	require.Equal(t, CodexServiceTierModeFollowUpstream, repo.updated.CodexServiceTierMode)
 }
 
 func TestAdminService_ListGroups_WithSearch(t *testing.T) {
