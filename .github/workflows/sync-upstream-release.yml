@@ -1,0 +1,116 @@
+name: Sync Upstream Release
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: 'Upstream tag to sync, for example v0.1.132. Defaults to latest release.'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sync-upstream-release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPOSITORY: Wei-Shaw/sub2api
+  BASE_BRANCH: fork
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve upstream release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${INPUT_TAG}" ]; then
+            TAG="${INPUT_TAG}"
+          else
+            TAG="$(gh release view --repo "${UPSTREAM_REPOSITORY}" --json tagName --jq .tagName)"
+          fi
+
+          if [ -z "${TAG}" ]; then
+            echo "No upstream release tag found"
+            exit 1
+          fi
+
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+          echo "branch=sync/upstream-${TAG}" >> "${GITHUB_OUTPUT}"
+
+      - name: Checkout fork branch
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.BASE_BRANCH }}
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          git fetch upstream --tags --force
+
+      - name: Skip if upstream tag is already merged
+        id: merged
+        run: |
+          set -euo pipefail
+
+          TAG="${{ steps.release.outputs.tag }}"
+          if git merge-base --is-ancestor "${TAG}" "HEAD"; then
+            echo "Upstream ${TAG} is already merged into ${BASE_BRANCH}"
+            echo "already_merged=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "already_merged=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Create sync branch
+        if: ${{ steps.merged.outputs.already_merged != 'true' }}
+        run: |
+          TAG="${{ steps.release.outputs.tag }}"
+          git checkout -B "${{ steps.release.outputs.branch }}" "${TAG}"
+
+      - name: Push sync branch
+        if: ${{ steps.merged.outputs.already_merged != 'true' }}
+        run: |
+          git push --force-with-lease origin "${{ steps.release.outputs.branch }}"
+
+      - name: Create pull request
+        if: ${{ steps.merged.outputs.already_merged != 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          TAG="${{ steps.release.outputs.tag }}"
+          BRANCH="${{ steps.release.outputs.branch }}"
+          PR_NUMBER="$(gh pr list \
+            --base "${BASE_BRANCH}" \
+            --head "${BRANCH}" \
+            --json number \
+            --jq '.[0].number // empty')"
+
+          if [ -n "${PR_NUMBER}" ]; then
+            gh pr edit "${PR_NUMBER}" \
+              --title "chore: sync upstream ${TAG}" \
+              --body "Sync upstream release ${TAG} from ${UPSTREAM_REPOSITORY} into ${BASE_BRANCH}."
+          else
+            gh pr create \
+              --base "${BASE_BRANCH}" \
+              --head "${BRANCH}" \
+              --title "chore: sync upstream ${TAG}" \
+              --body "Sync upstream release ${TAG} from ${UPSTREAM_REPOSITORY} into ${BASE_BRANCH}."
+          fi
