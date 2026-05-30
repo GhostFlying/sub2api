@@ -11,6 +11,7 @@ on:
         type: string
 
 permissions:
+  actions: write
   contents: write
   pull-requests: write
   issues: write
@@ -296,6 +297,21 @@ jobs:
               --title "chore: preview upstream ${TAG} on fork" \
               --body-file "${BODY_FILE}"
           fi
+
+      - name: Dispatch preview checks
+        if: ${{ steps.replay.outputs.result == 'success' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.release.outputs.branch }}
+        run: |
+          set -euo pipefail
+
+          gh workflow run "CI" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --ref "${BRANCH}"
+          gh workflow run "Security Scan" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --ref "${BRANCH}"
 
       - name: Close resolved conflict issue
         if: ${{ steps.replay.outputs.result == 'success' }}
