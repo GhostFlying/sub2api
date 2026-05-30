@@ -19,6 +19,7 @@ env:
   BASE_BRANCH: fork
   ANCHOR_BRANCH: upstream-release
   UPSTREAM_REPOSITORY: Wei-Shaw/sub2api
+  REQUIRED_CHECKS: test frontend golangci-lint backend-security frontend-security
 
 jobs:
   promote:
@@ -60,7 +61,7 @@ jobs:
 
           gh pr view "${PR_NUMBER}" \
             --repo "${GITHUB_REPOSITORY}" \
-            --json number,state,baseRefName,baseRefOid,headRefName,headRefOid,statusCheckRollup \
+            --json number,state,baseRefName,baseRefOid,headRefName,headRefOid \
             > /tmp/pr.json
 
           STATE="$(jq -r .state /tmp/pr.json)"
@@ -82,43 +83,45 @@ jobs:
             exit 1
           fi
 
-          CHECK_COUNT="$(jq '.statusCheckRollup | length' /tmp/pr.json)"
-          BAD_CHECKS="$(jq '
-            def passed:
-              if .__typename == "CheckRun" then
-                (.status == "COMPLETED" and (.conclusion == "SUCCESS" or .conclusion == "NEUTRAL" or .conclusion == "SKIPPED"))
-              elif .__typename == "StatusContext" then
-                (.state == "SUCCESS")
-              else
-                false
-              end;
-            [.statusCheckRollup[] | select((passed | not))] | length
-          ' /tmp/pr.json)"
+          gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/check-runs" \
+            --paginate \
+            --jq '.check_runs[] | {name,status,conclusion,html_url,started_at,completed_at}' \
+            > /tmp/check-runs.jsonl
 
-          if [ "${CHECK_COUNT}" -eq 0 ]; then
+          MISSING_CHECKS=""
+          BAD_CHECKS=""
+          for REQUIRED_CHECK in ${REQUIRED_CHECKS}; do
+            CHECK_JSON="$(jq -s --arg name "${REQUIRED_CHECK}" '
+              map(select(.name == $name))
+              | sort_by(.started_at // .completed_at // "")
+              | last // empty
+            ' /tmp/check-runs.jsonl)"
+
+            if [ -z "${CHECK_JSON}" ]; then
+              MISSING_CHECKS="${MISSING_CHECKS}"$'\n'"- ${REQUIRED_CHECK}: missing"
+              continue
+            fi
+
+            STATUS="$(jq -r '.status // "unknown"' <<<"${CHECK_JSON}")"
+            CONCLUSION="$(jq -r '.conclusion // ""' <<<"${CHECK_JSON}")"
+            URL="$(jq -r '.html_url // ""' <<<"${CHECK_JSON}")"
+
+            if [ "${STATUS}" != "completed" ] || { [ "${CONCLUSION}" != "success" ] && [ "${CONCLUSION}" != "neutral" ] && [ "${CONCLUSION}" != "skipped" ]; }; then
+              BAD_CHECKS="${BAD_CHECKS}"$'\n'"- ${REQUIRED_CHECK}: ${STATUS} ${CONCLUSION} ${URL}"
+            fi
+          done
+
+          if [ -n "${MISSING_CHECKS}" ]; then
             gh pr comment "${PR_NUMBER}" \
               --repo "${GITHUB_REPOSITORY}" \
-              --body "Refusing to promote: no PR checks have reported yet. Wait for checks to appear and pass, then comment \`/promote-fork\` again."
+              --body "Refusing to promote: required checks have not reported yet.${MISSING_CHECKS}"
             exit 1
           fi
 
-          if [ "${BAD_CHECKS}" -ne 0 ]; then
-            CHECK_LIST="$(jq -r '
-              def passed:
-                if .__typename == "CheckRun" then
-                  (.status == "COMPLETED" and (.conclusion == "SUCCESS" or .conclusion == "NEUTRAL" or .conclusion == "SKIPPED"))
-                elif .__typename == "StatusContext" then
-                  (.state == "SUCCESS")
-                else
-                  false
-                end;
-              .statusCheckRollup[]
-              | select((passed | not))
-              | "- " + ((.name // .context // "unknown check") | tostring) + ": " + ((.status // .state // "unknown") | tostring) + " " + ((.conclusion // "") | tostring)
-            ' /tmp/pr.json)"
+          if [ -n "${BAD_CHECKS}" ]; then
             gh pr comment "${PR_NUMBER}" \
               --repo "${GITHUB_REPOSITORY}" \
-              --body "Refusing to promote: PR checks are not all passing yet.\n\n${CHECK_LIST}"
+              --body "Refusing to promote: required checks are not all passing yet.${BAD_CHECKS}"
             exit 1
           fi
 
