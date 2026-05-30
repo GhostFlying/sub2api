@@ -9,3 +9,5 @@ This fork is maintained from a dedicated `fork` branch.
 4. Add a Docker workflow that publishes GHCR images when `fork` is updated.
 5. Leave deployment docs unchanged; production compose files can point at
    `ghcr.io/ghostflying/sub2api:fork`.
+6. Keep GitHub CLI pull request commands pinned to `${GITHUB_REPOSITORY}` so
+   fork workflows do not accidentally target the upstream repository.
