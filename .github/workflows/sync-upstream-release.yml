@@ -6,13 +6,14 @@ on:
   workflow_dispatch:
     inputs:
       upstream_tag:
-        description: 'Upstream tag to sync, for example v0.1.132. Defaults to latest release.'
+        description: 'Upstream tag to sync, for example v0.1.133. Defaults to latest release.'
         required: false
         type: string
 
 permissions:
   contents: write
   pull-requests: write
+  issues: write
 
 concurrency:
   group: sync-upstream-release
@@ -21,6 +22,8 @@ concurrency:
 env:
   UPSTREAM_REPOSITORY: Wei-Shaw/sub2api
   BASE_BRANCH: fork
+  ANCHOR_BRANCH: upstream-release
+  CONFLICT_ISSUE_LABEL: sync-upstream-conflict
 
 jobs:
   sync:
@@ -45,8 +48,11 @@ jobs:
             exit 1
           fi
 
+          SAFE_TAG="$(printf '%s' "${TAG}" | sed 's/[^A-Za-z0-9._-]/-/g')"
+          BRANCH="sync/upstream-${SAFE_TAG}"
+
           echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
-          echo "branch=sync/upstream-${TAG}" >> "${GITHUB_OUTPUT}"
+          echo "branch=${BRANCH}" >> "${GITHUB_OUTPUT}"
 
       - name: Checkout fork branch
         uses: actions/checkout@v6
@@ -56,64 +62,261 @@ jobs:
 
       - name: Configure git
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "$(git log -1 --format=%cn HEAD)"
+          git config user.email "$(git log -1 --format=%ce HEAD)"
 
-      - name: Add upstream remote
+      - name: Fetch upstream and fork refs
         run: |
+          set -euo pipefail
+
           git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
           git fetch upstream --tags --force
+          git fetch origin \
+            "+refs/heads/${BASE_BRANCH}:refs/remotes/origin/${BASE_BRANCH}" \
+            "+refs/heads/${ANCHOR_BRANCH}:refs/remotes/origin/${ANCHOR_BRANCH}"
+          git fetch origin \
+            "+refs/heads/sync/upstream-*:refs/remotes/origin/sync/upstream-*" || true
 
-      - name: Skip if upstream tag is already merged
-        id: merged
+      - name: Resolve sync state
+        id: state
         run: |
           set -euo pipefail
 
           TAG="${{ steps.release.outputs.tag }}"
-          if git merge-base --is-ancestor "${TAG}" "HEAD"; then
-            echo "Upstream ${TAG} is already merged into ${BASE_BRANCH}"
-            echo "already_merged=true" >> "${GITHUB_OUTPUT}"
+          TAG_SHA="$(git rev-parse "${TAG}^{commit}")"
+          ANCHOR_SHA="$(git rev-parse "origin/${ANCHOR_BRANCH}^{commit}")"
+          BASE_SHA="$(git rev-parse "origin/${BASE_BRANCH}^{commit}")"
+
+          echo "tag_sha=${TAG_SHA}" >> "${GITHUB_OUTPUT}"
+          echo "anchor_sha=${ANCHOR_SHA}" >> "${GITHUB_OUTPUT}"
+          echo "base_sha=${BASE_SHA}" >> "${GITHUB_OUTPUT}"
+
+          if [ "${ANCHOR_SHA}" = "${TAG_SHA}" ]; then
+            echo "Upstream ${TAG} is already the ${ANCHOR_BRANCH} baseline."
+            echo "already_current=true" >> "${GITHUB_OUTPUT}"
           else
-            echo "already_merged=false" >> "${GITHUB_OUTPUT}"
+            echo "already_current=false" >> "${GITHUB_OUTPUT}"
           fi
 
-      - name: Create sync branch
-        if: ${{ steps.merged.outputs.already_merged != 'true' }}
-        run: |
-          TAG="${{ steps.release.outputs.tag }}"
-          git checkout -B "${{ steps.release.outputs.branch }}" "${TAG}"
-
-      - name: Push sync branch
-        if: ${{ steps.merged.outputs.already_merged != 'true' }}
-        run: |
-          git push --force-with-lease origin "${{ steps.release.outputs.branch }}"
-
-      - name: Create pull request
-        if: ${{ steps.merged.outputs.already_merged != 'true' }}
+      - name: Close stale sync previews
+        if: ${{ steps.state.outputs.already_current != 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
+          CURRENT_BRANCH: ${{ steps.release.outputs.branch }}
+          CURRENT_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          gh pr list \
+            --repo "${GITHUB_REPOSITORY}" \
+            --base "${BASE_BRANCH}" \
+            --state open \
+            --json number,headRefName \
+            --jq '.[] | select(.headRefName | startswith("sync/upstream-")) | [.number, .headRefName] | @tsv' |
+          while IFS=$'\t' read -r PR_NUMBER HEAD_BRANCH; do
+            if [ -z "${PR_NUMBER}" ] || [ "${HEAD_BRANCH}" = "${CURRENT_BRANCH}" ]; then
+              continue
+            fi
+
+            gh pr close "${PR_NUMBER}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --comment "Closing this preview because upstream ${CURRENT_TAG} has superseded it. A new clean preview will be generated from ${CURRENT_BRANCH}."
+            git push origin ":refs/heads/${HEAD_BRANCH}" || true
+          done
+
+      - name: Replay fork patch stack
+        if: ${{ steps.state.outputs.already_current != 'true' }}
+        id: replay
         run: |
           set -euo pipefail
 
           TAG="${{ steps.release.outputs.tag }}"
           BRANCH="${{ steps.release.outputs.branch }}"
+          PATCH_STACK="/tmp/fork-patch-stack.txt"
+
+          git rev-list --reverse "origin/${ANCHOR_BRANCH}..origin/${BASE_BRANCH}" > "${PATCH_STACK}"
+          PATCH_COUNT="$(wc -l < "${PATCH_STACK}" | tr -d ' ')"
+          echo "patch_count=${PATCH_COUNT}" >> "${GITHUB_OUTPUT}"
+          echo "patch_stack=${PATCH_STACK}" >> "${GITHUB_OUTPUT}"
+
+          git checkout -B "${BRANCH}" "${TAG}"
+
+          FAILED_COMMIT=""
+          while IFS= read -r COMMIT; do
+            if [ -z "${COMMIT}" ]; then
+              continue
+            fi
+
+            echo "::group::Cherry-pick ${COMMIT}"
+            if git cherry-pick --empty=drop "${COMMIT}"; then
+              echo "::endgroup::"
+              continue
+            fi
+
+            FAILED_COMMIT="${COMMIT}"
+            git cherry-pick --abort || true
+            echo "::endgroup::"
+            break
+          done < "${PATCH_STACK}"
+
+          if [ -n "${FAILED_COMMIT}" ]; then
+            echo "result=conflict" >> "${GITHUB_OUTPUT}"
+            echo "failed_commit=${FAILED_COMMIT}" >> "${GITHUB_OUTPUT}"
+            echo "failed_subject=$(git log -1 --format=%s "${FAILED_COMMIT}")" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          echo "result=success" >> "${GITHUB_OUTPUT}"
+          echo "head_sha=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
+
+      - name: Create or update conflict issue
+        if: ${{ steps.replay.outputs.result == 'conflict' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+          FAILED_COMMIT: ${{ steps.replay.outputs.failed_commit }}
+          FAILED_SUBJECT: ${{ steps.replay.outputs.failed_subject }}
+          PATCH_STACK: ${{ steps.replay.outputs.patch_stack }}
+        run: |
+          set -euo pipefail
+
+          gh label create "${CONFLICT_ISSUE_LABEL}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --color B60205 \
+            --description "Upstream release sync needs manual conflict resolution" || true
+
+          BODY_FILE="$(mktemp)"
+          {
+            echo "Automated upstream release sync failed while replaying the fork patch stack."
+            echo
+            echo "- Upstream tag: \`${TAG}\`"
+            echo "- Baseline branch: \`${ANCHOR_BRANCH}\`"
+            echo "- Fork branch: \`${BASE_BRANCH}\`"
+            echo "- Failed commit: \`${FAILED_COMMIT}\` ${FAILED_SUBJECT}"
+            echo
+            echo "Patch stack:"
+            if [ -s "${PATCH_STACK}" ]; then
+              while IFS= read -r COMMIT; do
+                echo "- \`${COMMIT}\` $(git log -1 --format=%s "${COMMIT}")"
+              done < "${PATCH_STACK}"
+            else
+              echo "- No fork-only commits were found."
+            fi
+            echo
+            echo "Manual handling:"
+            echo "1. Create a local branch from \`${TAG}\`."
+            echo "2. Cherry-pick \`${ANCHOR_BRANCH}..${BASE_BRANCH}\` in order."
+            echo "3. Resolve conflicts and push a replacement \`sync/upstream-${TAG}\` preview branch."
+            echo "4. Keep \`${BASE_BRANCH}\` unchanged until a reviewed \`/promote-fork\` succeeds."
+          } > "${BODY_FILE}"
+
+          ISSUE_NUMBER="$(gh issue list \
+            --repo "${GITHUB_REPOSITORY}" \
+            --label "${CONFLICT_ISSUE_LABEL}" \
+            --state open \
+            --json number \
+            --jq '.[0].number // empty')"
+
+          if [ -n "${ISSUE_NUMBER}" ]; then
+            gh issue edit "${ISSUE_NUMBER}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "Upstream sync conflict: ${TAG}" \
+              --body-file "${BODY_FILE}"
+            gh issue comment "${ISSUE_NUMBER}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --body "Sync for ${TAG} still conflicts at \`${FAILED_COMMIT}\`."
+          else
+            gh issue create \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "Upstream sync conflict: ${TAG}" \
+              --label "${CONFLICT_ISSUE_LABEL}" \
+              --body-file "${BODY_FILE}"
+          fi
+
+          exit 1
+
+      - name: Push sync branch
+        if: ${{ steps.replay.outputs.result == 'success' }}
+        run: |
+          git push --force-with-lease origin \
+            "${{ steps.release.outputs.branch }}:refs/heads/${{ steps.release.outputs.branch }}"
+
+      - name: Create or update preview pull request
+        if: ${{ steps.replay.outputs.result == 'success' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+          BRANCH: ${{ steps.release.outputs.branch }}
+          TAG_SHA: ${{ steps.state.outputs.tag_sha }}
+          BASE_SHA: ${{ steps.state.outputs.base_sha }}
+          ANCHOR_SHA: ${{ steps.state.outputs.anchor_sha }}
+          HEAD_SHA: ${{ steps.replay.outputs.head_sha }}
+          PATCH_COUNT: ${{ steps.replay.outputs.patch_count }}
+        run: |
+          set -euo pipefail
+
+          BODY_FILE="$(mktemp)"
+          {
+            echo "Clean upstream release preview for \`${TAG}\`."
+            echo
+            echo "This PR is generated from:"
+            echo "- new upstream baseline: \`${TAG}\` (\`${TAG_SHA}\`)"
+            echo "- previous upstream baseline: \`${ANCHOR_BRANCH}\` (\`${ANCHOR_SHA}\`)"
+            echo "- current production fork: \`${BASE_BRANCH}\` (\`${BASE_SHA}\`)"
+            echo "- replayed fork patch count: \`${PATCH_COUNT}\`"
+            echo "- generated fork head: \`${HEAD_SHA}\`"
+            echo
+            echo "Review the diff from current \`${BASE_BRANCH}\` to this generated branch."
+            echo
+            echo "**Do not use the GitHub merge button.**"
+            echo
+            echo "After reviewing the diff and checks, comment \`/promote-fork\`. The promote workflow will force-with-lease rewrite \`${BASE_BRANCH}\`, move \`${ANCHOR_BRANCH}\` to \`${TAG}\`, close this PR, and delete \`${BRANCH}\`."
+          } > "${BODY_FILE}"
+
           PR_NUMBER="$(gh pr list \
             --repo "${GITHUB_REPOSITORY}" \
             --base "${BASE_BRANCH}" \
             --head "${BRANCH}" \
+            --state open \
             --json number \
             --jq '.[0].number // empty')"
 
           if [ -n "${PR_NUMBER}" ]; then
             gh pr edit "${PR_NUMBER}" \
               --repo "${GITHUB_REPOSITORY}" \
-              --title "chore: sync upstream ${TAG}" \
-              --body "Sync upstream release ${TAG} from ${UPSTREAM_REPOSITORY} into ${BASE_BRANCH}."
+              --title "chore: preview upstream ${TAG} on fork" \
+              --body-file "${BODY_FILE}"
+            gh pr ready "${PR_NUMBER}" --repo "${GITHUB_REPOSITORY}" --undo || true
           else
             gh pr create \
               --repo "${GITHUB_REPOSITORY}" \
               --base "${BASE_BRANCH}" \
               --head "${BRANCH}" \
-              --title "chore: sync upstream ${TAG}" \
-              --body "Sync upstream release ${TAG} from ${UPSTREAM_REPOSITORY} into ${BASE_BRANCH}."
+              --draft \
+              --title "chore: preview upstream ${TAG} on fork" \
+              --body-file "${BODY_FILE}"
           fi
+
+      - name: Close resolved conflict issue
+        if: ${{ steps.replay.outputs.result == 'success' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          gh issue list \
+            --repo "${GITHUB_REPOSITORY}" \
+            --label "${CONFLICT_ISSUE_LABEL}" \
+            --state open \
+            --json number \
+            --jq '.[].number' |
+          while IFS= read -r ISSUE_NUMBER; do
+            if [ -z "${ISSUE_NUMBER}" ]; then
+              continue
+            fi
+
+            gh issue close "${ISSUE_NUMBER}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --comment "Automated sync for ${TAG} completed successfully; closing the previous conflict report."
+          done

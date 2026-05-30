@@ -1,0 +1,177 @@
+name: Promote Fork
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  checks: read
+  statuses: read
+
+concurrency:
+  group: promote-fork-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+env:
+  BASE_BRANCH: fork
+  ANCHOR_BRANCH: upstream-release
+  UPSTREAM_REPOSITORY: Wei-Shaw/sub2api
+
+jobs:
+  promote:
+    if: ${{ github.event.issue.pull_request && contains(github.event.comment.body, '/promote-fork') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate promote request
+        id: request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+
+          COMMAND="$(printf '%s' "${COMMENT_BODY}" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+          if [ "${COMMAND}" != "/promote-fork" ]; then
+            gh pr comment "${PR_NUMBER}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --body "Refusing to promote: the promote command must be exactly \`/promote-fork\`."
+            exit 1
+          fi
+
+          PERMISSION="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/collaborators/${COMMENT_AUTHOR}/permission" \
+            --jq .permission)"
+
+          case "${PERMISSION}" in
+            admin|maintain|write)
+              ;;
+            *)
+              gh pr comment "${PR_NUMBER}" \
+                --repo "${GITHUB_REPOSITORY}" \
+                --body "Refusing to promote: @${COMMENT_AUTHOR} has \`${PERMISSION}\` permission, but \`write\`, \`maintain\`, or \`admin\` is required."
+              exit 1
+              ;;
+          esac
+
+          gh pr view "${PR_NUMBER}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --json number,state,baseRefName,baseRefOid,headRefName,headRefOid,statusCheckRollup \
+            > /tmp/pr.json
+
+          STATE="$(jq -r .state /tmp/pr.json)"
+          BASE_REF="$(jq -r .baseRefName /tmp/pr.json)"
+          HEAD_REF="$(jq -r .headRefName /tmp/pr.json)"
+          HEAD_SHA="$(jq -r .headRefOid /tmp/pr.json)"
+
+          if [ "${STATE}" != "OPEN" ]; then
+            gh pr comment "${PR_NUMBER}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --body "Refusing to promote: PR #${PR_NUMBER} is ${STATE}, not OPEN."
+            exit 1
+          fi
+
+          if [ "${BASE_REF}" != "${BASE_BRANCH}" ] || [[ "${HEAD_REF}" != sync/upstream-* ]]; then
+            gh pr comment "${PR_NUMBER}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --body "Refusing to promote: expected \`sync/upstream-* -> ${BASE_BRANCH}\`, got \`${HEAD_REF} -> ${BASE_REF}\`."
+            exit 1
+          fi
+
+          CHECK_COUNT="$(jq '.statusCheckRollup | length' /tmp/pr.json)"
+          BAD_CHECKS="$(jq '
+            def passed:
+              if .__typename == "CheckRun" then
+                (.status == "COMPLETED" and (.conclusion == "SUCCESS" or .conclusion == "NEUTRAL" or .conclusion == "SKIPPED"))
+              elif .__typename == "StatusContext" then
+                (.state == "SUCCESS")
+              else
+                false
+              end;
+            [.statusCheckRollup[] | select((passed | not))] | length
+          ' /tmp/pr.json)"
+
+          if [ "${CHECK_COUNT}" -eq 0 ]; then
+            gh pr comment "${PR_NUMBER}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --body "Refusing to promote: no PR checks have reported yet. Wait for checks to appear and pass, then comment \`/promote-fork\` again."
+            exit 1
+          fi
+
+          if [ "${BAD_CHECKS}" -ne 0 ]; then
+            CHECK_LIST="$(jq -r '
+              def passed:
+                if .__typename == "CheckRun" then
+                  (.status == "COMPLETED" and (.conclusion == "SUCCESS" or .conclusion == "NEUTRAL" or .conclusion == "SKIPPED"))
+                elif .__typename == "StatusContext" then
+                  (.state == "SUCCESS")
+                else
+                  false
+                end;
+              .statusCheckRollup[]
+              | select((passed | not))
+              | "- " + ((.name // .context // "unknown check") | tostring) + ": " + ((.status // .state // "unknown") | tostring) + " " + ((.conclusion // "") | tostring)
+            ' /tmp/pr.json)"
+            gh pr comment "${PR_NUMBER}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --body "Refusing to promote: PR checks are not all passing yet.\n\n${CHECK_LIST}"
+            exit 1
+          fi
+
+          TAG="${HEAD_REF#sync/upstream-}"
+          echo "pr_number=${PR_NUMBER}" >> "${GITHUB_OUTPUT}"
+          echo "head_ref=${HEAD_REF}" >> "${GITHUB_OUTPUT}"
+          echo "head_sha=${HEAD_SHA}" >> "${GITHUB_OUTPUT}"
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+
+      - name: Checkout fork branch
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.BASE_BRANCH }}
+          fetch-depth: 0
+
+      - name: Promote generated fork
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.request.outputs.pr_number }}
+          HEAD_REF: ${{ steps.request.outputs.head_ref }}
+          HEAD_SHA: ${{ steps.request.outputs.head_sha }}
+          TAG: ${{ steps.request.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          git fetch upstream --tags --force
+          git fetch origin \
+            "+refs/heads/${BASE_BRANCH}:refs/remotes/origin/${BASE_BRANCH}" \
+            "+refs/heads/${ANCHOR_BRANCH}:refs/remotes/origin/${ANCHOR_BRANCH}" \
+            "+refs/heads/${HEAD_REF}:refs/remotes/origin/${HEAD_REF}"
+
+          TAG_SHA="$(git rev-parse "${TAG}^{commit}")"
+          REMOTE_BASE_SHA="$(git rev-parse "origin/${BASE_BRANCH}^{commit}")"
+          REMOTE_ANCHOR_SHA="$(git rev-parse "origin/${ANCHOR_BRANCH}^{commit}")"
+          REMOTE_HEAD_SHA="$(git rev-parse "origin/${HEAD_REF}^{commit}")"
+
+          if [ "${REMOTE_HEAD_SHA}" != "${HEAD_SHA}" ]; then
+            gh pr comment "${PR_NUMBER}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --body "Refusing to promote: \`${HEAD_REF}\` moved from \`${HEAD_SHA}\` to \`${REMOTE_HEAD_SHA}\`. Re-run the sync workflow and review the new preview."
+            exit 1
+          fi
+
+          git push --atomic \
+            --force-with-lease="refs/heads/${BASE_BRANCH}:${REMOTE_BASE_SHA}" \
+            --force-with-lease="refs/heads/${ANCHOR_BRANCH}:${REMOTE_ANCHOR_SHA}" \
+            origin \
+            "${HEAD_SHA}:refs/heads/${BASE_BRANCH}" \
+            "${TAG_SHA}:refs/heads/${ANCHOR_BRANCH}"
+
+          gh pr close "${PR_NUMBER}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --comment "Promoted \`${HEAD_REF}\` to \`${BASE_BRANCH}\` at \`${HEAD_SHA}\` and moved \`${ANCHOR_BRANCH}\` to \`${TAG}\` (\`${TAG_SHA}\`). Docker publishing will run from the updated \`${BASE_BRANCH}\` branch."
+
+          git push origin ":refs/heads/${HEAD_REF}" || true
