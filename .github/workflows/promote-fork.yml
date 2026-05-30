@@ -178,3 +178,6 @@ jobs:
             --comment "Promoted \`${HEAD_REF}\` to \`${BASE_BRANCH}\` at \`${HEAD_SHA}\` and moved \`${ANCHOR_BRANCH}\` to \`${TAG}\` (\`${TAG_SHA}\`). Docker publishing will run from the updated \`${BASE_BRANCH}\` branch."
 
           git push origin ":refs/heads/${HEAD_REF}" || true
+          gh workflow run "Docker Image" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --ref "${BASE_BRANCH}"
