@@ -98,6 +98,7 @@ jobs:
           TAG="${{ steps.release.outputs.tag }}"
           BRANCH="${{ steps.release.outputs.branch }}"
           PR_NUMBER="$(gh pr list \
+            --repo "${GITHUB_REPOSITORY}" \
             --base "${BASE_BRANCH}" \
             --head "${BRANCH}" \
             --json number \
@@ -105,10 +106,12 @@ jobs:
 
           if [ -n "${PR_NUMBER}" ]; then
             gh pr edit "${PR_NUMBER}" \
+              --repo "${GITHUB_REPOSITORY}" \
               --title "chore: sync upstream ${TAG}" \
               --body "Sync upstream release ${TAG} from ${UPSTREAM_REPOSITORY} into ${BASE_BRANCH}."
           else
             gh pr create \
+              --repo "${GITHUB_REPOSITORY}" \
               --base "${BASE_BRANCH}" \
               --head "${BRANCH}" \
               --title "chore: sync upstream ${TAG}" \
