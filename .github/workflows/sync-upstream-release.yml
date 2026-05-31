@@ -71,7 +71,8 @@ jobs:
           set -euo pipefail
 
           git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
-          git fetch upstream --tags --force
+          git fetch upstream --tags --force \
+            "+refs/heads/main:refs/remotes/upstream/main"
           git fetch origin \
             "+refs/heads/${BASE_BRANCH}:refs/remotes/origin/${BASE_BRANCH}" \
             "+refs/heads/${ANCHOR_BRANCH}:refs/remotes/origin/${ANCHOR_BRANCH}"
@@ -84,15 +85,45 @@ jobs:
           set -euo pipefail
 
           TAG="${{ steps.release.outputs.tag }}"
+          VERSION="${TAG#v}"
           TAG_SHA="$(git rev-parse "${TAG}^{commit}")"
+          EFFECTIVE_BASE_SHA="${TAG_SHA}"
+          VERSION_SYNC_SHA=""
           ANCHOR_SHA="$(git rev-parse "origin/${ANCHOR_BRANCH}^{commit}")"
           BASE_SHA="$(git rev-parse "origin/${BASE_BRANCH}^{commit}")"
 
+          while IFS= read -r CANDIDATE; do
+            SUBJECT="$(git log -1 --format=%s "${CANDIDATE}")"
+            if [ "${SUBJECT}" != "chore: sync VERSION to ${VERSION} [skip ci]" ]; then
+              continue
+            fi
+
+            CHANGED_FILES="$(git diff-tree --no-commit-id --name-only -r "${CANDIDATE}")"
+            if [ "${CHANGED_FILES}" != "backend/cmd/server/VERSION" ]; then
+              continue
+            fi
+
+            VERSION_FILE="$(git show "${CANDIDATE}:backend/cmd/server/VERSION" | tr -d '\r\n')"
+            if [ "${VERSION_FILE}" != "${VERSION}" ]; then
+              continue
+            fi
+
+            VERSION_SYNC_SHA="${CANDIDATE}"
+            EFFECTIVE_BASE_SHA="${CANDIDATE}"
+            break
+          done < <(git rev-list --reverse "${TAG_SHA}..upstream/main" -- backend/cmd/server/VERSION)
+
           echo "tag_sha=${TAG_SHA}" >> "${GITHUB_OUTPUT}"
+          echo "effective_base_sha=${EFFECTIVE_BASE_SHA}" >> "${GITHUB_OUTPUT}"
+          echo "version_sync_sha=${VERSION_SYNC_SHA}" >> "${GITHUB_OUTPUT}"
           echo "anchor_sha=${ANCHOR_SHA}" >> "${GITHUB_OUTPUT}"
           echo "base_sha=${BASE_SHA}" >> "${GITHUB_OUTPUT}"
 
-          if [ "${ANCHOR_SHA}" = "${TAG_SHA}" ]; then
+          if [ -n "${VERSION_SYNC_SHA}" ]; then
+            echo "Using upstream VERSION sync baseline ${VERSION_SYNC_SHA} for ${TAG}."
+          fi
+
+          if [ "${ANCHOR_SHA}" = "${EFFECTIVE_BASE_SHA}" ]; then
             echo "Upstream ${TAG} is already the ${ANCHOR_BRANCH} baseline."
             echo "already_current=true" >> "${GITHUB_OUTPUT}"
           else
@@ -133,6 +164,7 @@ jobs:
 
           TAG="${{ steps.release.outputs.tag }}"
           BRANCH="${{ steps.release.outputs.branch }}"
+          EFFECTIVE_BASE_SHA="${{ steps.state.outputs.effective_base_sha }}"
           PATCH_STACK="/tmp/fork-patch-stack.txt"
 
           git rev-list --reverse "origin/${ANCHOR_BRANCH}..origin/${BASE_BRANCH}" > "${PATCH_STACK}"
@@ -140,7 +172,7 @@ jobs:
           echo "patch_count=${PATCH_COUNT}" >> "${GITHUB_OUTPUT}"
           echo "patch_stack=${PATCH_STACK}" >> "${GITHUB_OUTPUT}"
 
-          git checkout -B "${BRANCH}" "${TAG}"
+          git checkout -B "${BRANCH}" "${EFFECTIVE_BASE_SHA}"
 
           FAILED_COMMIT=""
           while IFS= read -r COMMIT; do
@@ -175,6 +207,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.release.outputs.tag }}
+          EFFECTIVE_BASE_SHA: ${{ steps.state.outputs.effective_base_sha }}
+          VERSION_SYNC_SHA: ${{ steps.state.outputs.version_sync_sha }}
           FAILED_COMMIT: ${{ steps.replay.outputs.failed_commit }}
           FAILED_SUBJECT: ${{ steps.replay.outputs.failed_subject }}
           PATCH_STACK: ${{ steps.replay.outputs.patch_stack }}
@@ -191,6 +225,10 @@ jobs:
             echo "Automated upstream release sync failed while replaying the fork patch stack."
             echo
             echo "- Upstream tag: \`${TAG}\`"
+            echo "- Effective upstream baseline: \`${EFFECTIVE_BASE_SHA}\`"
+            if [ -n "${VERSION_SYNC_SHA}" ]; then
+              echo "- Upstream VERSION sync commit: \`${VERSION_SYNC_SHA}\`"
+            fi
             echo "- Baseline branch: \`${ANCHOR_BRANCH}\`"
             echo "- Fork branch: \`${BASE_BRANCH}\`"
             echo "- Failed commit: \`${FAILED_COMMIT}\` ${FAILED_SUBJECT}"
@@ -205,7 +243,7 @@ jobs:
             fi
             echo
             echo "Manual handling:"
-            echo "1. Create a local branch from \`${TAG}\`."
+            echo "1. Create a local branch from \`${EFFECTIVE_BASE_SHA}\`."
             echo "2. Cherry-pick \`${ANCHOR_BRANCH}..${BASE_BRANCH}\` in order."
             echo "3. Resolve conflicts and push a replacement \`sync/upstream-${TAG}\` preview branch."
             echo "4. Keep \`${BASE_BRANCH}\` unchanged until a reviewed \`/promote-fork\` succeeds."
@@ -249,6 +287,8 @@ jobs:
           TAG: ${{ steps.release.outputs.tag }}
           BRANCH: ${{ steps.release.outputs.branch }}
           TAG_SHA: ${{ steps.state.outputs.tag_sha }}
+          EFFECTIVE_BASE_SHA: ${{ steps.state.outputs.effective_base_sha }}
+          VERSION_SYNC_SHA: ${{ steps.state.outputs.version_sync_sha }}
           BASE_SHA: ${{ steps.state.outputs.base_sha }}
           ANCHOR_SHA: ${{ steps.state.outputs.anchor_sha }}
           HEAD_SHA: ${{ steps.replay.outputs.head_sha }}
@@ -261,7 +301,11 @@ jobs:
             echo "Clean upstream release preview for \`${TAG}\`."
             echo
             echo "This PR is generated from:"
-            echo "- new upstream baseline: \`${TAG}\` (\`${TAG_SHA}\`)"
+            echo "- upstream release tag: \`${TAG}\` (\`${TAG_SHA}\`)"
+            echo "- effective upstream baseline: \`${EFFECTIVE_BASE_SHA}\`"
+            if [ -n "${VERSION_SYNC_SHA}" ]; then
+              echo "- upstream VERSION sync commit: \`${VERSION_SYNC_SHA}\`"
+            fi
             echo "- previous upstream baseline: \`${ANCHOR_BRANCH}\` (\`${ANCHOR_SHA}\`)"
             echo "- current production fork: \`${BASE_BRANCH}\` (\`${BASE_SHA}\`)"
             echo "- replayed fork patch count: \`${PATCH_COUNT}\`"
@@ -271,7 +315,7 @@ jobs:
             echo
             echo "**Do not use the GitHub merge button.**"
             echo
-            echo "After reviewing the diff and checks, comment \`/promote-fork\`. The promote workflow will force-with-lease rewrite \`${BASE_BRANCH}\`, move \`${ANCHOR_BRANCH}\` to \`${TAG}\`, close this PR, and delete \`${BRANCH}\`."
+            echo "After reviewing the diff and checks, comment \`/promote-fork\`. The promote workflow will force-with-lease rewrite \`${BASE_BRANCH}\`, move \`${ANCHOR_BRANCH}\` to the effective upstream baseline, close this PR, and delete \`${BRANCH}\`."
           } > "${BODY_FILE}"
 
           PR_NUMBER="$(gh pr list \
