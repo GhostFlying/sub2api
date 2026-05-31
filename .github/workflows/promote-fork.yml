@@ -148,16 +148,41 @@ jobs:
           set -euo pipefail
 
           git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
-          git fetch upstream --tags --force
+          git fetch upstream --tags --force \
+            "+refs/heads/main:refs/remotes/upstream/main"
           git fetch origin \
             "+refs/heads/${BASE_BRANCH}:refs/remotes/origin/${BASE_BRANCH}" \
             "+refs/heads/${ANCHOR_BRANCH}:refs/remotes/origin/${ANCHOR_BRANCH}" \
             "+refs/heads/${HEAD_REF}:refs/remotes/origin/${HEAD_REF}"
 
+          VERSION="${TAG#v}"
           TAG_SHA="$(git rev-parse "${TAG}^{commit}")"
+          EFFECTIVE_BASE_SHA="${TAG_SHA}"
+          VERSION_SYNC_SHA=""
           REMOTE_BASE_SHA="$(git rev-parse "origin/${BASE_BRANCH}^{commit}")"
           REMOTE_ANCHOR_SHA="$(git rev-parse "origin/${ANCHOR_BRANCH}^{commit}")"
           REMOTE_HEAD_SHA="$(git rev-parse "origin/${HEAD_REF}^{commit}")"
+
+          while IFS= read -r CANDIDATE; do
+            SUBJECT="$(git log -1 --format=%s "${CANDIDATE}")"
+            if [ "${SUBJECT}" != "chore: sync VERSION to ${VERSION} [skip ci]" ]; then
+              continue
+            fi
+
+            CHANGED_FILES="$(git diff-tree --no-commit-id --name-only -r "${CANDIDATE}")"
+            if [ "${CHANGED_FILES}" != "backend/cmd/server/VERSION" ]; then
+              continue
+            fi
+
+            VERSION_FILE="$(git show "${CANDIDATE}:backend/cmd/server/VERSION" | tr -d '\r\n')"
+            if [ "${VERSION_FILE}" != "${VERSION}" ]; then
+              continue
+            fi
+
+            VERSION_SYNC_SHA="${CANDIDATE}"
+            EFFECTIVE_BASE_SHA="${CANDIDATE}"
+            break
+          done < <(git rev-list --reverse "${TAG_SHA}..upstream/main" -- backend/cmd/server/VERSION)
 
           if [ "${REMOTE_HEAD_SHA}" != "${HEAD_SHA}" ]; then
             gh pr comment "${PR_NUMBER}" \
@@ -171,11 +196,17 @@ jobs:
             --force-with-lease="refs/heads/${ANCHOR_BRANCH}:${REMOTE_ANCHOR_SHA}" \
             origin \
             "${HEAD_SHA}:refs/heads/${BASE_BRANCH}" \
-            "${TAG_SHA}:refs/heads/${ANCHOR_BRANCH}"
+            "${EFFECTIVE_BASE_SHA}:refs/heads/${ANCHOR_BRANCH}"
+
+          if [ -n "${VERSION_SYNC_SHA}" ]; then
+            ANCHOR_DESCRIPTION="effective baseline \`${EFFECTIVE_BASE_SHA}\` for \`${TAG}\`, including upstream VERSION sync commit \`${VERSION_SYNC_SHA}\`"
+          else
+            ANCHOR_DESCRIPTION="\`${TAG}\` (\`${TAG_SHA}\`)"
+          fi
 
           gh pr close "${PR_NUMBER}" \
             --repo "${GITHUB_REPOSITORY}" \
-            --comment "Promoted \`${HEAD_REF}\` to \`${BASE_BRANCH}\` at \`${HEAD_SHA}\` and moved \`${ANCHOR_BRANCH}\` to \`${TAG}\` (\`${TAG_SHA}\`). Docker publishing will run from the updated \`${BASE_BRANCH}\` branch."
+            --comment "Promoted \`${HEAD_REF}\` to \`${BASE_BRANCH}\` at \`${HEAD_SHA}\` and moved \`${ANCHOR_BRANCH}\` to ${ANCHOR_DESCRIPTION}. Docker publishing will run from the updated \`${BASE_BRANCH}\` branch."
 
           git push origin ":refs/heads/${HEAD_REF}" || true
           gh workflow run "Docker Image" \
