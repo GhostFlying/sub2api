@@ -205,11 +205,27 @@ jobs:
             ANCHOR_DESCRIPTION="\`${TAG}\` (\`${TAG_SHA}\`)"
           fi
 
-          gh pr close "${PR_NUMBER}" \
-            --repo "${GITHUB_REPOSITORY}" \
-            --comment "Promoted \`${HEAD_REF}\` to \`${BASE_BRANCH}\` at \`${HEAD_SHA}\` and moved \`${ANCHOR_BRANCH}\` to ${ANCHOR_DESCRIPTION}. Docker publishing will run from the updated \`${BASE_BRANCH}\` branch."
-
-          git push origin ":refs/heads/${HEAD_REF}" || true
           gh workflow run "Docker Image" \
             --repo "${GITHUB_REPOSITORY}" \
             --ref "${BASE_BRANCH}"
+
+          PROMOTE_COMMENT="Promoted \`${HEAD_REF}\` to \`${BASE_BRANCH}\` at \`${HEAD_SHA}\` and moved \`${ANCHOR_BRANCH}\` to ${ANCHOR_DESCRIPTION}. Docker publishing has been dispatched from the updated \`${BASE_BRANCH}\` branch."
+          PR_STATE="$(gh pr view "${PR_NUMBER}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --json state \
+            --jq .state || echo UNKNOWN)"
+
+          if [ "${PR_STATE}" = "OPEN" ]; then
+            gh pr close "${PR_NUMBER}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --comment "${PROMOTE_COMMENT}" || \
+              gh pr comment "${PR_NUMBER}" \
+                --repo "${GITHUB_REPOSITORY}" \
+                --body "${PROMOTE_COMMENT}" || true
+          else
+            gh pr comment "${PR_NUMBER}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --body "${PROMOTE_COMMENT}" || true
+          fi
+
+          git push origin ":refs/heads/${HEAD_REF}" || true
