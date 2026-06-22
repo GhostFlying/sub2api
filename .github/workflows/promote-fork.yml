@@ -30,7 +30,7 @@ jobs:
       - name: Validate promote request
         id: request
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.FORK_MAINTENANCE_TOKEN }}
           COMMENT_BODY: ${{ github.event.comment.body }}
           COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
           PR_NUMBER: ${{ github.event.issue.number }}
@@ -137,10 +137,11 @@ jobs:
         with:
           ref: ${{ env.BASE_BRANCH }}
           fetch-depth: 0
+          token: ${{ secrets.FORK_MAINTENANCE_TOKEN }}
 
       - name: Promote generated fork
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.FORK_MAINTENANCE_TOKEN }}
           PR_NUMBER: ${{ steps.request.outputs.pr_number }}
           HEAD_REF: ${{ steps.request.outputs.head_ref }}
           HEAD_SHA: ${{ steps.request.outputs.head_sha }}
