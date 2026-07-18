@@ -3,8 +3,11 @@ package service
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type openAIRateLimitResetCreditDetailPayload struct {
@@ -30,9 +33,11 @@ type openAIRateLimitResetCreditDetailsPayload struct {
 type openAIRateLimitResetCreditDetails struct {
 	AvailableCount       *int
 	AvailableCreditCount int
+	IncompleteCredits    int
 	CreditListPresent    bool
 	Credits              []OpenAIRateLimitResetCreditDetail
 	AutoResetCandidates  []openAIAutoResetCreditCandidate
+	Candidates           []OpenAIQuotaResetCreditCandidate
 }
 
 // openAIAutoResetCreditCandidate 仅在服务内部流转。上游卡 ID 不进入 API DTO、
@@ -40,6 +45,16 @@ type openAIRateLimitResetCreditDetails struct {
 type openAIAutoResetCreditCandidate struct {
 	ID        string
 	ExpiresAt string
+}
+
+// OpenAIQuotaResetCreditCandidate is internal scheduling metadata. It must not
+// be embedded in the public quota response because ID is an opaque upstream
+// capability used only by the exact-credit consume call.
+type OpenAIQuotaResetCreditCandidate struct {
+	ID           string
+	Status       string
+	ExpiresAt    time.Time
+	ExpiresAtRaw string
 }
 
 func parseOpenAIRateLimitResetCreditDetails(body []byte) (openAIRateLimitResetCreditDetails, error) {
@@ -76,9 +91,12 @@ func parseOpenAIRateLimitResetCreditDetails(body []byte) (openAIRateLimitResetCr
 
 	credits := make([]OpenAIRateLimitResetCreditDetail, 0, len(rawCredits))
 	autoResetCandidates := make([]openAIAutoResetCreditCandidate, 0, len(rawCredits))
+	candidates := make([]OpenAIQuotaResetCreditCandidate, 0, len(rawCredits))
 	availableCreditCount := 0
+	incompleteCredits := 0
 	for _, raw := range rawCredits {
 		if raw == nil {
+			incompleteCredits++
 			continue
 		}
 		resetType := strings.TrimSpace(raw.ResetType)
@@ -97,6 +115,7 @@ func parseOpenAIRateLimitResetCreditDetails(body []byte) (openAIRateLimitResetCr
 			expiresAt = strings.TrimSpace(raw.ExpiresAtCamel)
 		}
 		if expiresAt == "" {
+			incompleteCredits++
 			continue
 		}
 		credits = append(credits, OpenAIRateLimitResetCreditDetail{ExpiresAt: expiresAt})
@@ -111,14 +130,50 @@ func parseOpenAIRateLimitResetCreditDetails(body []byte) (openAIRateLimitResetCr
 			ID:        creditID,
 			ExpiresAt: expiresAt,
 		})
+		expiresAtTime, err := time.Parse(time.RFC3339, expiresAt)
+		if err != nil {
+			incompleteCredits++
+			continue
+		}
+		if creditID == "" {
+			incompleteCredits++
+			continue
+		}
+		candidates = append(candidates, OpenAIQuotaResetCreditCandidate{
+			ID:           creditID,
+			Status:       strings.TrimSpace(raw.Status),
+			ExpiresAt:    expiresAtTime,
+			ExpiresAtRaw: expiresAt,
+		})
 	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		if candidates[i].ExpiresAt.Equal(candidates[j].ExpiresAt) {
+			return candidates[i].ID < candidates[j].ID
+		}
+		return candidates[i].ExpiresAt.Before(candidates[j].ExpiresAt)
+	})
 	return openAIRateLimitResetCreditDetails{
 		AvailableCount:       availableCount,
 		AvailableCreditCount: availableCreditCount,
+		IncompleteCredits:    incompleteCredits,
 		CreditListPresent:    creditListPresent,
 		Credits:              credits,
 		AutoResetCandidates:  autoResetCandidates,
+		Candidates:           candidates,
 	}, nil
+}
+
+func schedulableOpenAIResetCredits(details openAIRateLimitResetCreditDetails) ([]OpenAIQuotaResetCreditCandidate, error) {
+	if !details.CreditListPresent {
+		return nil, fmt.Errorf("reset credit details are unavailable")
+	}
+	if details.IncompleteCredits > 0 || len(details.Candidates) != details.AvailableCreditCount {
+		return nil, fmt.Errorf("available reset credit details are incomplete")
+	}
+	if details.AvailableCount != nil && *details.AvailableCount != details.AvailableCreditCount {
+		return nil, fmt.Errorf("available reset credit count does not match credit details")
+	}
+	return append([]OpenAIQuotaResetCreditCandidate(nil), details.Candidates...), nil
 }
 
 func parseOpenAIResetCreditAvailableCount(values ...json.RawMessage) *int {
