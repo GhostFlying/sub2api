@@ -189,6 +189,17 @@ func ProvideOpenAIQuotaService(
 	return service
 }
 
+func ProvideBackgroundTaskService(
+	repo BackgroundTaskRepository,
+	accountRepo AccountRepository,
+	quotaService *OpenAIQuotaService,
+	opsRepo OpsRepository,
+) *BackgroundTaskService {
+	service := NewBackgroundTaskService(repo, accountRepo, quotaService, opsRepo)
+	service.Start()
+	return service
+}
+
 func ProvideAccountUsageService(
 	accountRepo AccountRepository,
 	usageLogRepo UsageLogRepository,
@@ -792,6 +803,7 @@ var ProviderSet = wire.NewSet(
 	ProvideGrokTokenProvider,
 	ProvideOpenAITokenProvider,
 	ProvideOpenAIQuotaService,
+	ProvideBackgroundTaskService,
 	ProvideGrokQuotaService,
 	ProvideClaudeTokenProvider,
 	NewAntigravityGatewayService,
