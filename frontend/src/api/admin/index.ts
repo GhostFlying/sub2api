@@ -36,6 +36,7 @@ import riskControlAPI from './riskControl'
 import adminComplianceAPI from './compliance'
 import auditAPI from './audit'
 import pluginsAPI from './plugins'
+import backgroundTasksAPI from './backgroundTasks'
 
 /**
  * Unified admin API object for convenient access
@@ -73,7 +74,8 @@ export const adminAPI = {
   riskControl: riskControlAPI,
   compliance: adminComplianceAPI,
   audit: auditAPI,
-  plugins: pluginsAPI
+	plugins: pluginsAPI,
+  backgroundTasks: backgroundTasksAPI
 }
 
 export {
@@ -109,7 +111,8 @@ export {
   riskControlAPI,
   adminComplianceAPI,
   auditAPI,
-  pluginsAPI
+	pluginsAPI,
+  backgroundTasksAPI
 }
 
 export default adminAPI
@@ -127,3 +130,4 @@ export type {
   PluginUISession,
   PluginTestResult
 } from './plugins'
+export type { BackgroundTask, BackgroundTaskStatus, BackgroundTaskListParams } from './backgroundTasks'
