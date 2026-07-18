@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -21,6 +22,39 @@ import (
 // infraerrors value so the handler maps it to 409 Conflict (not a bare 500);
 // errors.Is still matches it by identity since ResetCredit returns this var.
 var ErrSparkShadowResetNotSupported = infraerrors.New(http.StatusConflict, "SPARK_SHADOW_RESET_NOT_SUPPORTED", "spark shadow account does not support credit reset; reset the parent account")
+
+type OpenAIQuotaResetErrorKind string
+
+const (
+	OpenAIQuotaResetErrorRequest  OpenAIQuotaResetErrorKind = "request"
+	OpenAIQuotaResetErrorUpstream OpenAIQuotaResetErrorKind = "upstream"
+	OpenAIQuotaResetErrorAuth     OpenAIQuotaResetErrorKind = "auth"
+)
+
+// OpenAIQuotaResetAttemptError preserves HTTP-facing ApplicationError details
+// while allowing the durable task handler to classify ambiguous/retryable
+// attempts without parsing strings.
+type OpenAIQuotaResetAttemptError struct {
+	Kind                    OpenAIQuotaResetErrorKind
+	UpstreamStatus          int
+	Retryable               bool
+	DefinitiveNoConsumption bool
+	Err                     error
+}
+
+func (e *OpenAIQuotaResetAttemptError) Error() string {
+	if e == nil || e.Err == nil {
+		return "openai quota reset attempt failed"
+	}
+	return e.Err.Error()
+}
+
+func (e *OpenAIQuotaResetAttemptError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
 
 // Endpoints used by the OpenAI/ChatGPT/Codex quota query and reset feature.
 const (
@@ -121,6 +155,7 @@ type OpenAIQuotaService struct {
 	privacyClientFactory PrivacyClientFactory
 	agentIdentityTaskMu  sync.Mutex
 	agentIdentityWS      agentIdentityWSConnectionInvalidator
+	upstreamTimeout      time.Duration
 }
 
 // NewOpenAIQuotaService constructs a quota service. token provider is required —
@@ -154,7 +189,7 @@ func (s *OpenAIQuotaService) QueryUsage(ctx context.Context, accountID int64) (*
 		return nil, infraerrors.Newf(http.StatusBadGateway, "OPENAI_QUOTA_CLIENT_ERROR", "failed to build upstream client: %v", err)
 	}
 
-	callCtx, cancel := context.WithTimeout(ctx, openaiQuotaUpstreamTimeout)
+	callCtx, cancel := context.WithTimeout(ctx, s.callTimeout())
 	defer cancel()
 	agentIdentity := s.isAgentIdentityAccount(ctx, accountID)
 
@@ -295,6 +330,55 @@ func (s *OpenAIQuotaService) queryResetCreditDetails(ctx context.Context, client
 	return &details
 }
 
+// ListResetCredits returns the exact, task-eligible reset credits. Unlike the
+// public QueryUsage projection, this method intentionally retains opaque IDs.
+func (s *OpenAIQuotaService) ListResetCredits(ctx context.Context, accountID int64) ([]OpenAIQuotaResetCreditCandidate, error) {
+	if err := s.ensureResetAccount(ctx, accountID); err != nil {
+		return nil, err
+	}
+	accessToken, chatGPTAccountID, proxyURL, fedRAMP, err := s.prepareUpstreamCall(ctx, accountID)
+	if err != nil {
+		return nil, err
+	}
+	client, err := s.privacyClientFactory(proxyURL)
+	if err != nil {
+		return nil, infraerrors.Newf(http.StatusBadGateway, "OPENAI_QUOTA_CLIENT_ERROR", "failed to build upstream client: %v", err)
+	}
+	callCtx, cancel := context.WithTimeout(ctx, s.callTimeout())
+	defer cancel()
+	agentIdentity := s.isAgentIdentityAccount(ctx, accountID)
+	for recovered := false; ; {
+		headers, expectedTaskID, headerErr := s.buildCodexQuotaHeaders(callCtx, accountID, accessToken, chatGPTAccountID, fedRAMP)
+		if headerErr != nil {
+			return nil, infraerrors.Newf(http.StatusBadGateway, "OPENAI_QUOTA_AUTH_FAILED", "failed to build upstream authentication: %v", headerErr)
+		}
+		resp, requestErr := client.R().SetContext(callCtx).SetHeaders(headers).Get(chatGPTRateLimitCreditsURL)
+		if requestErr != nil {
+			return nil, infraerrors.Newf(http.StatusBadGateway, "OPENAI_QUOTA_CREDIT_DETAILS_FAILED", "upstream request failed: %v", requestErr)
+		}
+		if !resp.IsSuccessState() {
+			if agentIdentity && !recovered && isAgentIdentityTaskInvalidHTTPResponse(resp.StatusCode, []byte(resp.String())) {
+				recovered = true
+				if recoverErr := s.recoverAgentIdentityTask(ctx, accountID, expectedTaskID); recoverErr != nil {
+					return nil, infraerrors.Newf(http.StatusBadGateway, "OPENAI_QUOTA_AUTH_FAILED", "agent identity task recovery failed: %v", recoverErr)
+				}
+				continue
+			}
+			body := truncate(s.redactQuotaErrorBody(ctx, accountID, resp.String()), 240)
+			return nil, infraerrors.Newf(mapUpstreamStatus(resp.StatusCode), "OPENAI_QUOTA_CREDIT_DETAILS_UPSTREAM_ERROR", "upstream returned %d: %s", resp.StatusCode, body)
+		}
+		details, parseErr := parseOpenAIRateLimitResetCreditDetails(resp.Bytes())
+		if parseErr != nil {
+			return nil, infraerrors.Newf(http.StatusBadGateway, "OPENAI_QUOTA_CREDIT_DETAILS_INVALID", "invalid reset credit details: %v", parseErr)
+		}
+		candidates, candidateErr := schedulableOpenAIResetCredits(details)
+		if candidateErr != nil {
+			return nil, infraerrors.Newf(http.StatusConflict, "OPENAI_QUOTA_CREDIT_NOT_SCHEDULABLE", "%v", candidateErr)
+		}
+		return candidates, nil
+	}
+}
+
 // ResetCredit consumes one rate_limit_reset_credit for the given OpenAI account.
 // The redeem_request_id is auto-generated (uuid-like) — upstream uses it for
 // idempotency. Returns the consumed credit metadata so the UI can refresh.
@@ -303,7 +387,7 @@ func (s *OpenAIQuotaService) ResetCredit(ctx context.Context, accountID int64) (
 	if err != nil {
 		return nil, infraerrors.Newf(http.StatusInternalServerError, "OPENAI_QUOTA_REDEEM_ID_FAILED", "failed to generate redeem id: %v", err)
 	}
-	return s.resetCredit(ctx, accountID, "", redeemRequestID, false)
+	return s.resetCredit(ctx, accountID, redeemRequestID, "")
 }
 
 // ResetCreditTargeted 使用固定卡 ID 与兑换 ID执行自动消费。调用方必须在重试时
@@ -314,39 +398,53 @@ func (s *OpenAIQuotaService) ResetCreditTargeted(ctx context.Context, accountID 
 	if creditID == "" || redeemRequestID == "" {
 		return nil, infraerrors.New(http.StatusBadRequest, "OPENAI_QUOTA_TARGETED_RESET_INVALID", "credit_id and redeem_request_id are required")
 	}
-	return s.resetCredit(ctx, accountID, creditID, redeemRequestID, true)
+	return s.resetCredit(ctx, accountID, redeemRequestID, creditID)
 }
 
-func (s *OpenAIQuotaService) resetCredit(ctx context.Context, accountID int64, creditID, redeemRequestID string, targeted bool) (*OpenAIQuotaResetResult, error) {
-	// Shadow guard: resetting credits via a shadow account would silently
-	// operate on the parent's quota; that is surprising and unwanted. Callers
-	// must reset the parent account directly.
-	//
-	// Fail-closed: if the account cannot be loaded (transient DB error), we
-	// must NOT fall through to prepareUpstreamCall. That function resolves a
-	// shadow to its parent and would perform a parent-level reset — exactly
-	// what this guard must prevent. Return the load error instead.
-	if s.accountRepo != nil {
-		acc, loadErr := s.accountRepo.GetByID(ctx, accountID)
-		if loadErr != nil {
-			return nil, infraerrors.Newf(http.StatusNotFound, "OPENAI_QUOTA_ACCOUNT_NOT_FOUND", "account not found: %v", loadErr)
-		}
-		if acc.IsShadow() {
-			return nil, ErrSparkShadowResetNotSupported
-		}
+// ResetCreditByID consumes exactly one selected credit using a caller-owned
+// idempotency key. Neither value is ever regenerated inside this method.
+func (s *OpenAIQuotaService) ResetCreditByID(ctx context.Context, accountID int64, redeemRequestID, creditID string) (*OpenAIQuotaResetResult, error) {
+	redeemRequestID = strings.TrimSpace(redeemRequestID)
+	creditID = strings.TrimSpace(creditID)
+	if redeemRequestID == "" || creditID == "" {
+		return nil, infraerrors.New(http.StatusBadRequest, "OPENAI_QUOTA_RESET_INVALID_ID", "redeem_request_id and credit_id are required")
 	}
+	return s.resetCredit(ctx, accountID, redeemRequestID, creditID)
+}
 
+func (s *OpenAIQuotaService) ensureResetAccount(ctx context.Context, accountID int64) error {
+	if s == nil || s.accountRepo == nil {
+		return infraerrors.New(http.StatusInternalServerError, "OPENAI_QUOTA_NOT_CONFIGURED", "openai quota service is not configured")
+	}
+	acc, err := s.accountRepo.GetByID(ctx, accountID)
+	if err != nil {
+		return infraerrors.Newf(http.StatusNotFound, "OPENAI_QUOTA_ACCOUNT_NOT_FOUND", "account not found: %v", err)
+	}
+	if acc == nil {
+		return infraerrors.New(http.StatusNotFound, "OPENAI_QUOTA_ACCOUNT_NOT_FOUND", "account not found")
+	}
+	if acc.IsShadow() {
+		return ErrSparkShadowResetNotSupported
+	}
+	return nil
+}
+
+func (s *OpenAIQuotaService) resetCredit(ctx context.Context, accountID int64, redeemRequestID, creditID string) (*OpenAIQuotaResetResult, error) {
+	// Fail closed before prepareUpstreamCall can resolve a Spark shadow to its
+	// parent and accidentally consume the parent's reset credit.
+	if err := s.ensureResetAccount(ctx, accountID); err != nil {
+		return nil, err
+	}
 	accessToken, chatGPTAccountID, proxyURL, fedRAMP, err := s.prepareUpstreamCall(ctx, accountID)
 	if err != nil {
 		return nil, err
 	}
-
 	client, err := s.privacyClientFactory(proxyURL)
 	if err != nil {
 		return nil, infraerrors.Newf(http.StatusBadGateway, "OPENAI_QUOTA_CLIENT_ERROR", "failed to build upstream client: %v", err)
 	}
 
-	callCtx, cancel := context.WithTimeout(ctx, openaiQuotaUpstreamTimeout)
+	callCtx, cancel := context.WithTimeout(ctx, s.callTimeout())
 	defer cancel()
 	agentIdentity := s.isAgentIdentityAccount(ctx, accountID)
 
@@ -358,7 +456,7 @@ func (s *OpenAIQuotaService) resetCredit(ctx context.Context, accountID int64, c
 		}
 		headers["content-type"] = "application/json"
 		body := map[string]string{"redeem_request_id": redeemRequestID}
-		if targeted {
+		if creditID != "" {
 			body["credit_id"] = creditID
 		}
 		resp, err := client.R().
@@ -368,24 +466,32 @@ func (s *OpenAIQuotaService) resetCredit(ctx context.Context, accountID int64, c
 			SetSuccessResult(&payload).
 			Post(chatGPTRateLimitResetURL)
 		if err != nil {
-			return nil, infraerrors.Newf(http.StatusBadGateway, "OPENAI_QUOTA_RESET_REQUEST_FAILED", "upstream request failed: %v", err)
+			appErr := infraerrors.Newf(http.StatusBadGateway, "OPENAI_QUOTA_RESET_REQUEST_FAILED", "upstream request failed: %v", err)
+			return nil, &OpenAIQuotaResetAttemptError{Kind: OpenAIQuotaResetErrorRequest, Retryable: !errors.Is(ctx.Err(), context.Canceled), Err: appErr}
 		}
 		if !resp.IsSuccessState() {
 			if agentIdentity && !recovered && isAgentIdentityTaskInvalidHTTPResponse(resp.StatusCode, []byte(resp.String())) {
 				recovered = true
 				if err := s.recoverAgentIdentityTask(ctx, accountID, expectedTaskID); err != nil {
-					return nil, infraerrors.Newf(http.StatusBadGateway, "OPENAI_QUOTA_AUTH_FAILED", "agent identity task recovery failed: %v", err)
+					appErr := infraerrors.Newf(http.StatusBadGateway, "OPENAI_QUOTA_AUTH_FAILED", "agent identity task recovery failed: %v", err)
+					return nil, &OpenAIQuotaResetAttemptError{
+						Kind: OpenAIQuotaResetErrorAuth, DefinitiveNoConsumption: true, Err: appErr,
+					}
 				}
 				continue
 			}
 			status := resp.StatusCode
-			if targeted {
-				slog.Warn("openai_quota_targeted_reset_failed", "account_id", accountID, "status", status)
-				return nil, infraerrors.Newf(mapUpstreamStatus(status), "OPENAI_QUOTA_RESET_UPSTREAM_ERROR", "upstream returned %d", status)
-			}
+			definitiveNoConsumption := openAIQuotaResetDefinitiveRejection(status)
 			body := truncate(s.redactQuotaErrorBody(callCtx, accountID, resp.String()), 240)
 			slog.Warn("openai_quota_reset_failed", "account_id", accountID, "status", status, "body", body)
-			return nil, infraerrors.Newf(mapUpstreamStatus(status), "OPENAI_QUOTA_RESET_UPSTREAM_ERROR", "upstream returned %d: %s", status, body)
+			appErr := infraerrors.Newf(mapUpstreamStatus(status), "OPENAI_QUOTA_RESET_UPSTREAM_ERROR", "upstream returned %d: %s", status, body)
+			return nil, &OpenAIQuotaResetAttemptError{
+				Kind:                    OpenAIQuotaResetErrorUpstream,
+				UpstreamStatus:          status,
+				Retryable:               !definitiveNoConsumption,
+				DefinitiveNoConsumption: definitiveNoConsumption,
+				Err:                     appErr,
+			}
 		}
 		break
 	}
@@ -396,6 +502,28 @@ func (s *OpenAIQuotaService) resetCredit(ctx context.Context, accountID int64, c
 		"windows_reset", payload.WindowsReset,
 	)
 	return &payload, nil
+}
+
+func openAIQuotaResetDefinitiveRejection(status int) bool {
+	switch status {
+	case http.StatusBadRequest,
+		http.StatusUnauthorized,
+		http.StatusForbidden,
+		http.StatusNotFound,
+		http.StatusMethodNotAllowed,
+		http.StatusUnsupportedMediaType,
+		http.StatusUnprocessableEntity:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *OpenAIQuotaService) callTimeout() time.Duration {
+	if s != nil && s.upstreamTimeout > 0 {
+		return s.upstreamTimeout
+	}
+	return openaiQuotaUpstreamTimeout
 }
 
 // prepareUpstreamCall loads the account, validates it, obtains a fresh access
