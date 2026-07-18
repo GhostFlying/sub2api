@@ -117,6 +117,7 @@ func provideCleanup(
 	ollamaCloudUsage *service.OllamaCloudUsageService,
 	auditLog *service.AuditLogService,
 	promptAudit *securityaudit.PromptService,
+	backgroundTasks *service.BackgroundTaskService,
 ) func() {
 	return func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -150,6 +151,12 @@ func provideCleanup(
 			{"OpsRuntimeSettingsRefresh", func() error {
 				if opsService != nil {
 					opsService.StopRuntimeSettingsRefresh()
+				}
+				return nil
+			}},
+			{"BackgroundTaskService", func() error {
+				if backgroundTasks != nil {
+					return backgroundTasks.Stop(ctx)
 				}
 				return nil
 			}},
