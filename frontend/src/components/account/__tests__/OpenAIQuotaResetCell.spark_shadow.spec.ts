@@ -4,12 +4,22 @@ import OpenAIQuotaResetCell from '../OpenAIQuotaResetCell.vue'
 import ConfirmDialog from '@/components/common/ConfirmDialog.vue'
 import type { Account } from '@/types'
 import { refreshOpenAIQuota, resetOpenAIQuota, type OpenAIQuotaRefreshResult } from '@/api/admin/accounts'
+import { backgroundTasksAPI } from '@/api/admin/backgroundTasks'
 
 vi.mock('@/api/admin/accounts', () => ({
   refreshOpenAIQuota: vi.fn(),
   resetOpenAIQuota: vi.fn(),
   refreshOpenAIReferrals: vi.fn(),
   sendOpenAIReferralInvite: vi.fn(),
+}))
+
+vi.mock('@/api/admin/backgroundTasks', () => ({
+  backgroundTasksAPI: {
+    list: vi.fn(),
+    createOpenAIQuotaReset: vi.fn(),
+    cancel: vi.fn(),
+    retry: vi.fn(),
+  },
 }))
 
 vi.mock('vue-i18n', async () => {
@@ -57,13 +67,14 @@ function makeAccount(overrides: Partial<Account>): Account {
   }
 }
 
-// 第二个按钮(橙色)是 reset 按钮::disabled="resetting||loading||!canReset" :title="resetButtonTitle"
 const resetButton = (wrapper: ReturnType<typeof mount>) =>
-  wrapper.findAll('button')[1]
+  wrapper.get('[data-testid="quota-reset-button"]')
 
 beforeEach(() => {
   vi.mocked(refreshOpenAIQuota).mockReset()
   vi.mocked(resetOpenAIQuota).mockReset()
+  vi.mocked(backgroundTasksAPI.list).mockReset()
+  vi.mocked(backgroundTasksAPI.list).mockResolvedValue({ items: [], total: 0, page: 1, page_size: 20 })
 })
 
 describe('OpenAIQuotaResetCell — Codex 点数', () => {
@@ -157,6 +168,9 @@ describe('OpenAIQuotaResetCell — 外审 F6:影子禁用重置', () => {
     const btn = resetButton(wrapper)
     expect(btn.attributes('disabled')).toBeDefined()
     expect(btn.attributes('title')).toBe('admin.accounts.openaiQuotaReset.resetTooltipShadow')
+    const schedule = wrapper.get('[data-testid="quota-schedule-button"]')
+    expect(schedule.attributes('disabled')).toBeDefined()
+    expect(schedule.attributes('title')).toBe('admin.accounts.openaiQuotaReset.scheduleTooltipShadow')
     wrapper.unmount()
   })
 
