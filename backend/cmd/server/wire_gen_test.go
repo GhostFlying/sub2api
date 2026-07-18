@@ -86,6 +86,7 @@ func TestProvideCleanup_WithMinimalDependencies_NoPanic(t *testing.T) {
 		nil, // upstreamBillingProbe
 		nil, // auditLog
 		nil, // promptAudit
+		nil, // backgroundTasks
 	)
 
 	require.NotPanics(t, func() {
