@@ -22,16 +22,19 @@ branch and not a Docker publishing source.
 5. Otherwise, the workflow creates `sync/upstream-<tag>` from the effective
    baseline and cherry-picks `upstream-release..fork` onto it with
    `--empty=drop`.
-6. A successful replay opens or updates a draft preview PR from
+6. If a cherry-pick conflicts only in `backend/cmd/server/wire_gen.go`, the
+   workflow regenerates Wire from the merged provider sources and continues.
+   Any other conflict still requires manual resolution.
+7. A successful replay opens or updates a draft preview PR from
    `sync/upstream-<tag>` to `fork`. Review the generated diff, but do not use
    the GitHub merge button.
-7. If replay conflicts, the workflow opens or updates a conflict issue and
+8. If replay conflicts, the workflow opens or updates a conflict issue and
    leaves `fork` unchanged.
-8. After review and passing checks, comment `/promote-fork` on the preview PR.
-9. The promote workflow verifies commenter permission and checks, then
+9. After review and passing checks, comment `/promote-fork` on the preview PR.
+10. The promote workflow verifies commenter permission and checks, then
    force-with-lease rewrites `fork`, moves `upstream-release` to the promoted
    effective upstream baseline, closes the PR, and deletes the sync branch.
-10. The Docker workflow publishes `ghcr.io/ghostflying/sub2api:fork` only when
+11. The Docker workflow publishes `ghcr.io/ghostflying/sub2api:fork` only when
    `fork` is updated.
-11. Keep GitHub CLI pull request commands pinned to `${GITHUB_REPOSITORY}` so
+12. Keep GitHub CLI pull request commands pinned to `${GITHUB_REPOSITORY}` so
     fork workflows do not accidentally target the upstream repository.

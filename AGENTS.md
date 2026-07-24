@@ -36,14 +36,17 @@ of the raw tag commit.
    baseline.
 5. Replay `upstream-release..fork` onto the sync branch in order with
    `git cherry-pick --empty=drop`.
-6. If replay succeeds, push the sync branch and open or update a draft preview
+6. If replay conflicts only in `backend/cmd/server/wire_gen.go`, regenerate
+   Wire from the merged provider sources and continue the cherry-pick. Do not
+   use this recovery path when any other file conflicts.
+7. If replay succeeds, push the sync branch and open or update a draft preview
    PR from `sync/upstream-<tag>` to `fork`.
-7. Dispatch the preview CI and security workflows for the sync branch.
-8. After review and passing checks, promote by commenting `/promote-fork` on the
+8. Dispatch the preview CI and security workflows for the sync branch.
+9. After review and passing checks, promote by commenting `/promote-fork` on the
    preview PR.
-9. The promote workflow must atomically rewrite `fork` to the reviewed sync
+10. The promote workflow must atomically rewrite `fork` to the reviewed sync
    branch and move `upstream-release` to the promoted effective baseline.
-10. Docker publishing runs from the updated `fork` branch.
+11. Docker publishing runs from the updated `fork` branch.
 
 Do not use the GitHub merge button for generated sync PRs.
 
@@ -61,6 +64,8 @@ When the sync workflow reports a replay conflict:
 5. Cherry-pick `upstream-release..fork` in order with `--empty=drop`.
 6. Resolve the conflicting commit by preserving the intended fork behavior while
    incorporating upstream changes.
+   If `backend/cmd/server/wire_gen.go` is the only conflict, regenerate it with
+   `go generate ./cmd/server` from `backend/` instead of editing generated code.
 7. Continue the cherry-pick, then replay the remaining fork-only commits.
 8. Add any durable fork-maintenance fixes as new commits on the sync branch so
    they become part of the fork-only patch stack after promotion.
