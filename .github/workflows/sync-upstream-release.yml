@@ -131,6 +131,15 @@ jobs:
             echo "already_current=false" >> "${GITHUB_OUTPUT}"
           fi
 
+      - name: Set up Go for generated conflict recovery
+        if: ${{ steps.state.outputs.already_current != 'true' }}
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: backend/go.mod
+          check-latest: false
+          cache: true
+          cache-dependency-path: backend/go.sum
+
       - name: Close stale sync previews
         if: ${{ steps.state.outputs.already_current != 'true' }}
         env:
@@ -185,6 +194,22 @@ jobs:
             if git cherry-pick --empty=drop "${COMMIT}"; then
               echo "::endgroup::"
               continue
+            fi
+
+            CONFLICTED_FILES="$(git diff --name-only --diff-filter=U)"
+            if [ "${CONFLICTED_FILES}" = "backend/cmd/server/wire_gen.go" ]; then
+              echo "Only the generated Wire file conflicts; regenerating it from merged providers."
+              if (
+                cd backend
+                go generate ./cmd/server
+              ); then
+                git add backend/cmd/server/wire_gen.go
+                if git diff --cached --check &&
+                  GIT_EDITOR=true git cherry-pick --continue; then
+                  echo "::endgroup::"
+                  continue
+                fi
+              fi
             fi
 
             FAILED_COMMIT="${COMMIT}"
