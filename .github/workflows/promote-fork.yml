@@ -12,19 +12,19 @@ permissions:
   checks: read
   statuses: read
 
-concurrency:
-  group: promote-fork-${{ github.event.issue.number }}
-  cancel-in-progress: false
-
 env:
   BASE_BRANCH: fork
   ANCHOR_BRANCH: upstream-release
   UPSTREAM_REPOSITORY: Wei-Shaw/sub2api
+  CONFLICT_ISSUE_LABEL: sync-upstream-conflict
   REQUIRED_CHECKS: test frontend golangci-lint backend-security frontend-security
 
 jobs:
   promote:
     if: ${{ github.event.issue.pull_request && contains(github.event.comment.body, '/promote-fork') }}
+    concurrency:
+      group: fork-maintenance
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     steps:
       - name: Validate promote request
@@ -209,6 +209,28 @@ jobs:
           gh workflow run "Docker Image" \
             --repo "${GITHUB_REPOSITORY}" \
             --ref "${BASE_BRANCH}"
+
+          if ISSUE_NUMBERS="$(gh issue list \
+            --repo "${GITHUB_REPOSITORY}" \
+            --label "${CONFLICT_ISSUE_LABEL}" \
+            --state open \
+            --json number,title |
+          jq -r --arg title "Upstream sync conflict: ${TAG}" \
+            '.[] | select(.title == $title) | .number')"; then
+            while IFS= read -r ISSUE_NUMBER; do
+              if [ -z "${ISSUE_NUMBER}" ]; then
+                continue
+              fi
+
+              if ! gh issue close "${ISSUE_NUMBER}" \
+                --repo "${GITHUB_REPOSITORY}" \
+                --comment "Promoted ${TAG} to \`${BASE_BRANCH}\`; closing this stale conflict report."; then
+                echo "::warning::Failed to close stale conflict issue #${ISSUE_NUMBER} after promotion."
+              fi
+            done <<<"${ISSUE_NUMBERS}"
+          else
+            echo "::warning::Failed to list stale conflict issues after promotion."
+          fi
 
           PROMOTE_COMMENT="Promoted \`${HEAD_REF}\` to \`${BASE_BRANCH}\` at \`${HEAD_SHA}\` and moved \`${ANCHOR_BRANCH}\` to ${ANCHOR_DESCRIPTION}. Docker publishing has been dispatched from the updated \`${BASE_BRANCH}\` branch."
           PR_STATE="$(gh pr view "${PR_NUMBER}" \
