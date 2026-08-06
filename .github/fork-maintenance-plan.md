@@ -23,7 +23,8 @@ branch and not a Docker publishing source.
    skips replay and closes any stale conflict report for the promoted release.
 5. If an open preview PR already targets the current `fork` head and its sync
    branch contains the effective baseline, the workflow keeps that reviewed
-   preview instead of replaying the old patch stack again.
+   preview only when its machine-readable source-ref marker matches the current
+   `fork`, current `upstream-release`, effective baseline, and preview head.
 6. Otherwise, the workflow creates `sync/upstream-<tag>` from the effective
    baseline and cherry-picks `upstream-release..fork` onto it with
    `--empty=drop`.
@@ -32,13 +33,15 @@ branch and not a Docker publishing source.
    Any other conflict still requires manual resolution.
 8. A successful replay opens or updates a draft preview PR from
    `sync/upstream-<tag>` to `fork`. Review the generated diff, but do not use
-   the GitHub merge button.
+   the GitHub merge button. Before publishing the preview, the workflow verifies
+   that the source `fork` and `upstream-release` refs have not moved.
 9. If replay conflicts, the workflow opens or updates a conflict issue and
    leaves `fork` unchanged. Before publishing the conflict, it verifies that
    the fetched `fork` and `upstream-release` refs have not moved.
 10. After review and passing checks, comment `/promote-fork` on the preview PR.
-11. The promote workflow verifies commenter permission and checks, then
-   force-with-lease rewrites `fork`, moves `upstream-release` to the promoted
+11. The promote workflow verifies commenter permission, checks, and the
+    preview's recorded source refs. It refuses stale previews; otherwise it
+    force-with-lease rewrites `fork`, moves `upstream-release` to the promoted
     effective upstream baseline, closes stale conflict reports, closes the PR,
     and deletes the sync branch.
 12. The Docker workflow publishes `ghcr.io/ghostflying/sub2api:fork` only when
