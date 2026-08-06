@@ -62,13 +62,14 @@ jobs:
 
           gh pr view "${PR_NUMBER}" \
             --repo "${GITHUB_REPOSITORY}" \
-            --json number,state,baseRefName,baseRefOid,headRefName,headRefOid \
+            --json baseRefName,body,headRefName,headRefOid,state \
             > /tmp/pr.json
 
           STATE="$(jq -r .state /tmp/pr.json)"
           BASE_REF="$(jq -r .baseRefName /tmp/pr.json)"
           HEAD_REF="$(jq -r .headRefName /tmp/pr.json)"
           HEAD_SHA="$(jq -r .headRefOid /tmp/pr.json)"
+          PR_BODY="$(jq -r .body /tmp/pr.json)"
 
           if [ "${STATE}" != "OPEN" ]; then
             gh pr comment "${PR_NUMBER}" \
@@ -83,6 +84,32 @@ jobs:
               --body "Refusing to promote: expected \`sync/upstream-* -> ${BASE_BRANCH}\`, got \`${HEAD_REF} -> ${BASE_REF}\`."
             exit 1
           fi
+
+          TAG="${HEAD_REF#sync/upstream-}"
+          MARKER_JSON="$(sed -n \
+            's/^<!-- fork-sync-source \(.*\) -->$/\1/p' \
+            <<<"${PR_BODY}" |
+          tail -n 1)"
+          if ! jq -e \
+            --arg tag "${TAG}" \
+            --arg head_sha "${HEAD_SHA}" \
+            '
+              .version == 1 and
+              .tag == $tag and
+              (.base_sha | test("^[0-9a-f]{40}$")) and
+              (.anchor_sha | test("^[0-9a-f]{40}$")) and
+              (.effective_base_sha | test("^[0-9a-f]{40}$")) and
+              .head_sha == $head_sha
+            ' <<<"${MARKER_JSON}" >/dev/null 2>&1; then
+            gh pr comment "${PR_NUMBER}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --body "Refusing to promote: the preview source-ref marker is missing or does not match the reviewed head. Re-run the sync workflow and review the regenerated preview."
+            exit 1
+          fi
+
+          SOURCE_BASE_SHA="$(jq -r .base_sha <<<"${MARKER_JSON}")"
+          SOURCE_ANCHOR_SHA="$(jq -r .anchor_sha <<<"${MARKER_JSON}")"
+          SOURCE_EFFECTIVE_BASE_SHA="$(jq -r .effective_base_sha <<<"${MARKER_JSON}")"
 
           gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/check-runs" \
             --paginate \
@@ -126,11 +153,13 @@ jobs:
             exit 1
           fi
 
-          TAG="${HEAD_REF#sync/upstream-}"
           echo "pr_number=${PR_NUMBER}" >> "${GITHUB_OUTPUT}"
           echo "head_ref=${HEAD_REF}" >> "${GITHUB_OUTPUT}"
           echo "head_sha=${HEAD_SHA}" >> "${GITHUB_OUTPUT}"
           echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+          echo "source_base_sha=${SOURCE_BASE_SHA}" >> "${GITHUB_OUTPUT}"
+          echo "source_anchor_sha=${SOURCE_ANCHOR_SHA}" >> "${GITHUB_OUTPUT}"
+          echo "source_effective_base_sha=${SOURCE_EFFECTIVE_BASE_SHA}" >> "${GITHUB_OUTPUT}"
 
       - name: Checkout fork branch
         uses: actions/checkout@v6
@@ -146,6 +175,9 @@ jobs:
           HEAD_REF: ${{ steps.request.outputs.head_ref }}
           HEAD_SHA: ${{ steps.request.outputs.head_sha }}
           TAG: ${{ steps.request.outputs.tag }}
+          SOURCE_BASE_SHA: ${{ steps.request.outputs.source_base_sha }}
+          SOURCE_ANCHOR_SHA: ${{ steps.request.outputs.source_anchor_sha }}
+          SOURCE_EFFECTIVE_BASE_SHA: ${{ steps.request.outputs.source_effective_base_sha }}
         run: |
           set -euo pipefail
 
@@ -193,12 +225,26 @@ jobs:
             exit 1
           fi
 
+          if [ "${REMOTE_BASE_SHA}" != "${SOURCE_BASE_SHA}" ] ||
+            [ "${REMOTE_ANCHOR_SHA}" != "${SOURCE_ANCHOR_SHA}" ] ||
+            [ "${EFFECTIVE_BASE_SHA}" != "${SOURCE_EFFECTIVE_BASE_SHA}" ]; then
+            gh pr comment "${PR_NUMBER}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --body "Refusing to promote: the preview was generated from stale fork-maintenance refs or a different effective baseline. Re-run the sync workflow and review the regenerated preview."
+            echo "Preview ${BASE_BRANCH}: ${SOURCE_BASE_SHA}; current: ${REMOTE_BASE_SHA}"
+            echo "Preview ${ANCHOR_BRANCH}: ${SOURCE_ANCHOR_SHA}; current: ${REMOTE_ANCHOR_SHA}"
+            echo "Preview effective baseline: ${SOURCE_EFFECTIVE_BASE_SHA}; current: ${EFFECTIVE_BASE_SHA}"
+            exit 1
+          fi
+
           git push --atomic \
-            --force-with-lease="refs/heads/${BASE_BRANCH}:${REMOTE_BASE_SHA}" \
-            --force-with-lease="refs/heads/${ANCHOR_BRANCH}:${REMOTE_ANCHOR_SHA}" \
+            --force-with-lease="refs/heads/${BASE_BRANCH}:${SOURCE_BASE_SHA}" \
+            --force-with-lease="refs/heads/${ANCHOR_BRANCH}:${SOURCE_ANCHOR_SHA}" \
+            --force-with-lease="refs/heads/${HEAD_REF}:${HEAD_SHA}" \
             origin \
             "${HEAD_SHA}:refs/heads/${BASE_BRANCH}" \
-            "${EFFECTIVE_BASE_SHA}:refs/heads/${ANCHOR_BRANCH}"
+            "${EFFECTIVE_BASE_SHA}:refs/heads/${ANCHOR_BRANCH}" \
+            "${HEAD_SHA}:refs/heads/${HEAD_REF}"
 
           if [ -n "${VERSION_SYNC_SHA}" ]; then
             ANCHOR_DESCRIPTION="effective baseline \`${EFFECTIVE_BASE_SHA}\` for \`${TAG}\`, including upstream VERSION sync commit \`${VERSION_SYNC_SHA}\`"
