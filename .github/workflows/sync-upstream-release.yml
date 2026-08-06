@@ -17,7 +17,7 @@ permissions:
   issues: write
 
 concurrency:
-  group: sync-upstream-release
+  group: fork-maintenance
   cancel-in-progress: false
 
 env:
@@ -131,8 +131,56 @@ jobs:
             echo "already_current=false" >> "${GITHUB_OUTPUT}"
           fi
 
-      - name: Set up Go for generated conflict recovery
+      - name: Resolve active sync preview
         if: ${{ steps.state.outputs.already_current != 'true' }}
+        id: preview
+        env:
+          GH_TOKEN: ${{ secrets.FORK_MAINTENANCE_TOKEN }}
+          BRANCH: ${{ steps.release.outputs.branch }}
+          BASE_SHA: ${{ steps.state.outputs.base_sha }}
+          EFFECTIVE_BASE_SHA: ${{ steps.state.outputs.effective_base_sha }}
+        run: |
+          set -euo pipefail
+
+          PREVIEW_SHA="$(git rev-parse --verify "origin/${BRANCH}^{commit}" 2>/dev/null || true)"
+          if [ -z "${PREVIEW_SHA}" ]; then
+            echo "active=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          PR_NUMBER="$(gh pr list \
+            --repo "${GITHUB_REPOSITORY}" \
+            --base "${BASE_BRANCH}" \
+            --head "${BRANCH}" \
+            --state open \
+            --json number \
+            --jq '.[0].number // empty')"
+          if [ -z "${PR_NUMBER}" ]; then
+            echo "active=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          gh pr view "${PR_NUMBER}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --json baseRefOid,headRefOid \
+            > /tmp/active-sync-preview.json
+          PR_BASE_SHA="$(jq -r .baseRefOid /tmp/active-sync-preview.json)"
+          PR_HEAD_SHA="$(jq -r .headRefOid /tmp/active-sync-preview.json)"
+
+          if [ "${PR_BASE_SHA}" != "${BASE_SHA}" ] ||
+            [ "${PR_HEAD_SHA}" != "${PREVIEW_SHA}" ] ||
+            ! git merge-base --is-ancestor "${EFFECTIVE_BASE_SHA}" "${PREVIEW_SHA}"; then
+            echo "active=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          echo "Active preview PR #${PR_NUMBER} already covers ${BRANCH} at ${PREVIEW_SHA}."
+          echo "active=true" >> "${GITHUB_OUTPUT}"
+          echo "pr_number=${PR_NUMBER}" >> "${GITHUB_OUTPUT}"
+          echo "head_sha=${PREVIEW_SHA}" >> "${GITHUB_OUTPUT}"
+
+      - name: Set up Go for generated conflict recovery
+        if: ${{ steps.state.outputs.already_current != 'true' && steps.preview.outputs.active != 'true' }}
         uses: actions/setup-go@v6
         with:
           go-version-file: backend/go.mod
@@ -141,7 +189,7 @@ jobs:
           cache-dependency-path: backend/go.sum
 
       - name: Close stale sync previews
-        if: ${{ steps.state.outputs.already_current != 'true' }}
+        if: ${{ steps.state.outputs.already_current != 'true' && steps.preview.outputs.active != 'true' }}
         env:
           GH_TOKEN: ${{ secrets.FORK_MAINTENANCE_TOKEN }}
           CURRENT_BRANCH: ${{ steps.release.outputs.branch }}
@@ -167,7 +215,7 @@ jobs:
           done
 
       - name: Replay fork patch stack
-        if: ${{ steps.state.outputs.already_current != 'true' }}
+        if: ${{ steps.state.outputs.already_current != 'true' && steps.preview.outputs.active != 'true' }}
         id: replay
         run: |
           set -euo pipefail
@@ -235,11 +283,27 @@ jobs:
           TAG: ${{ steps.release.outputs.tag }}
           EFFECTIVE_BASE_SHA: ${{ steps.state.outputs.effective_base_sha }}
           VERSION_SYNC_SHA: ${{ steps.state.outputs.version_sync_sha }}
+          BASE_SHA: ${{ steps.state.outputs.base_sha }}
+          ANCHOR_SHA: ${{ steps.state.outputs.anchor_sha }}
           FAILED_COMMIT: ${{ steps.replay.outputs.failed_commit }}
           FAILED_SUBJECT: ${{ steps.replay.outputs.failed_subject }}
           PATCH_STACK: ${{ steps.replay.outputs.patch_stack }}
         run: |
           set -euo pipefail
+
+          git fetch origin \
+            "+refs/heads/${BASE_BRANCH}:refs/remotes/origin/${BASE_BRANCH}" \
+            "+refs/heads/${ANCHOR_BRANCH}:refs/remotes/origin/${ANCHOR_BRANCH}"
+          CURRENT_BASE_SHA="$(git rev-parse "origin/${BASE_BRANCH}^{commit}")"
+          CURRENT_ANCHOR_SHA="$(git rev-parse "origin/${ANCHOR_BRANCH}^{commit}")"
+
+          if [ "${CURRENT_BASE_SHA}" != "${BASE_SHA}" ] ||
+            [ "${CURRENT_ANCHOR_SHA}" != "${ANCHOR_SHA}" ]; then
+            echo "::notice::Skipping stale conflict result because fork maintenance refs moved during this run."
+            echo "Original ${BASE_BRANCH}: ${BASE_SHA}; current: ${CURRENT_BASE_SHA}"
+            echo "Original ${ANCHOR_BRANCH}: ${ANCHOR_SHA}; current: ${CURRENT_ANCHOR_SHA}"
+            exit 0
+          fi
 
           gh label create "${CONFLICT_ISSUE_LABEL}" \
             --repo "${GITHUB_REPOSITORY}" \
@@ -275,14 +339,22 @@ jobs:
             echo "4. Keep \`${BASE_BRANCH}\` unchanged until a reviewed \`/promote-fork\` succeeds."
           } > "${BODY_FILE}"
 
-          ISSUE_NUMBER="$(gh issue list \
+          ISSUE_JSON="$(gh issue list \
             --repo "${GITHUB_REPOSITORY}" \
             --label "${CONFLICT_ISSUE_LABEL}" \
-            --state open \
-            --json number \
-            --jq '.[0].number // empty')"
+            --state all \
+            --limit 100 \
+            --json number,state,title |
+          jq -c --arg title "Upstream sync conflict: ${TAG}" \
+            '[.[] | select(.title == $title)] | sort_by(.number) | last // empty')"
+          ISSUE_NUMBER="$(jq -r '.number // empty' <<<"${ISSUE_JSON}")"
+          ISSUE_STATE="$(jq -r '.state // empty' <<<"${ISSUE_JSON}")"
 
           if [ -n "${ISSUE_NUMBER}" ]; then
+            if [ "${ISSUE_STATE}" = "CLOSED" ]; then
+              gh issue reopen "${ISSUE_NUMBER}" \
+                --repo "${GITHUB_REPOSITORY}"
+            fi
             gh issue edit "${ISSUE_NUMBER}" \
               --repo "${GITHUB_REPOSITORY}" \
               --title "Upstream sync conflict: ${TAG}" \
@@ -383,20 +455,32 @@ jobs:
             --repo "${GITHUB_REPOSITORY}" \
             --ref "${BRANCH}"
 
-      - name: Close resolved conflict issue
-        if: ${{ steps.replay.outputs.result == 'success' }}
+      - name: Close resolved or stale conflict issue
+        if: ${{ steps.state.outputs.already_current == 'true' || steps.preview.outputs.active == 'true' || steps.replay.outputs.result == 'success' }}
         env:
           GH_TOKEN: ${{ secrets.FORK_MAINTENANCE_TOKEN }}
           TAG: ${{ steps.release.outputs.tag }}
+          ALREADY_CURRENT: ${{ steps.state.outputs.already_current }}
+          ACTIVE_PREVIEW: ${{ steps.preview.outputs.active }}
+          PREVIEW_PR_NUMBER: ${{ steps.preview.outputs.pr_number }}
         run: |
           set -euo pipefail
+
+          if [ "${ALREADY_CURRENT}" = "true" ]; then
+            CLOSE_COMMENT="Upstream ${TAG} is already the promoted baseline; closing this stale conflict report."
+          elif [ "${ACTIVE_PREVIEW}" = "true" ]; then
+            CLOSE_COMMENT="A current clean preview is already available in PR #${PREVIEW_PR_NUMBER}; closing this resolved conflict report."
+          else
+            CLOSE_COMMENT="Automated sync for ${TAG} completed successfully; closing the previous conflict report."
+          fi
 
           gh issue list \
             --repo "${GITHUB_REPOSITORY}" \
             --label "${CONFLICT_ISSUE_LABEL}" \
             --state open \
-            --json number \
-            --jq '.[].number' |
+            --json number,title |
+          jq -r --arg title "Upstream sync conflict: ${TAG}" \
+            '.[] | select(.title == $title) | .number' |
           while IFS= read -r ISSUE_NUMBER; do
             if [ -z "${ISSUE_NUMBER}" ]; then
               continue
@@ -404,5 +488,5 @@ jobs:
 
             gh issue close "${ISSUE_NUMBER}" \
               --repo "${GITHUB_REPOSITORY}" \
-              --comment "Automated sync for ${TAG} completed successfully; closing the previous conflict report."
+              --comment "${CLOSE_COMMENT}"
           done
