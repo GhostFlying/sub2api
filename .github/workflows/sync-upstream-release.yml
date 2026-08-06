@@ -137,7 +137,9 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.FORK_MAINTENANCE_TOKEN }}
           BRANCH: ${{ steps.release.outputs.branch }}
+          TAG: ${{ steps.release.outputs.tag }}
           BASE_SHA: ${{ steps.state.outputs.base_sha }}
+          ANCHOR_SHA: ${{ steps.state.outputs.anchor_sha }}
           EFFECTIVE_BASE_SHA: ${{ steps.state.outputs.effective_base_sha }}
         run: |
           set -euo pipefail
@@ -162,13 +164,32 @@ jobs:
 
           gh pr view "${PR_NUMBER}" \
             --repo "${GITHUB_REPOSITORY}" \
-            --json baseRefOid,headRefOid \
+            --json baseRefOid,body,headRefOid \
             > /tmp/active-sync-preview.json
           PR_BASE_SHA="$(jq -r .baseRefOid /tmp/active-sync-preview.json)"
           PR_HEAD_SHA="$(jq -r .headRefOid /tmp/active-sync-preview.json)"
+          PR_BODY="$(jq -r .body /tmp/active-sync-preview.json)"
+          MARKER_JSON="$(sed -n \
+            's/^<!-- fork-sync-source \(.*\) -->$/\1/p' \
+            <<<"${PR_BODY}" |
+          tail -n 1)"
 
           if [ "${PR_BASE_SHA}" != "${BASE_SHA}" ] ||
             [ "${PR_HEAD_SHA}" != "${PREVIEW_SHA}" ] ||
+            ! jq -e \
+              --arg tag "${TAG}" \
+              --arg base_sha "${BASE_SHA}" \
+              --arg anchor_sha "${ANCHOR_SHA}" \
+              --arg effective_base_sha "${EFFECTIVE_BASE_SHA}" \
+              --arg head_sha "${PREVIEW_SHA}" \
+              '
+                .version == 1 and
+                .tag == $tag and
+                .base_sha == $base_sha and
+                .anchor_sha == $anchor_sha and
+                .effective_base_sha == $effective_base_sha and
+                .head_sha == $head_sha
+              ' <<<"${MARKER_JSON}" >/dev/null 2>&1 ||
             ! git merge-base --is-ancestor "${EFFECTIVE_BASE_SHA}" "${PREVIEW_SHA}"; then
             echo "active=false" >> "${GITHUB_OUTPUT}"
             exit 0
@@ -374,9 +395,42 @@ jobs:
 
       - name: Push sync branch
         if: ${{ steps.replay.outputs.result == 'success' }}
+        env:
+          BRANCH: ${{ steps.release.outputs.branch }}
+          BASE_SHA: ${{ steps.state.outputs.base_sha }}
+          ANCHOR_SHA: ${{ steps.state.outputs.anchor_sha }}
         run: |
-          git push --force-with-lease origin \
-            "${{ steps.release.outputs.branch }}:refs/heads/${{ steps.release.outputs.branch }}"
+          set -euo pipefail
+
+          git fetch origin \
+            "+refs/heads/${BASE_BRANCH}:refs/remotes/origin/${BASE_BRANCH}" \
+            "+refs/heads/${ANCHOR_BRANCH}:refs/remotes/origin/${ANCHOR_BRANCH}"
+          CURRENT_BASE_SHA="$(git rev-parse "origin/${BASE_BRANCH}^{commit}")"
+          CURRENT_ANCHOR_SHA="$(git rev-parse "origin/${ANCHOR_BRANCH}^{commit}")"
+
+          if [ "${CURRENT_BASE_SHA}" != "${BASE_SHA}" ] ||
+            [ "${CURRENT_ANCHOR_SHA}" != "${ANCHOR_SHA}" ]; then
+            echo "::error::Fork maintenance refs moved during replay; refusing to publish a stale preview."
+            echo "Original ${BASE_BRANCH}: ${BASE_SHA}; current: ${CURRENT_BASE_SHA}"
+            echo "Original ${ANCHOR_BRANCH}: ${ANCHOR_SHA}; current: ${CURRENT_ANCHOR_SHA}"
+            exit 1
+          fi
+
+          CURRENT_PREVIEW_SHA="$(git ls-remote origin "refs/heads/${BRANCH}" | awk '{print $1}')"
+          if [ -n "${CURRENT_PREVIEW_SHA}" ]; then
+            PREVIEW_LEASE="--force-with-lease=refs/heads/${BRANCH}:${CURRENT_PREVIEW_SHA}"
+          else
+            PREVIEW_LEASE="--force-with-lease=refs/heads/${BRANCH}:"
+          fi
+
+          git push --atomic \
+            --force-with-lease="refs/heads/${BASE_BRANCH}:${BASE_SHA}" \
+            --force-with-lease="refs/heads/${ANCHOR_BRANCH}:${ANCHOR_SHA}" \
+            "${PREVIEW_LEASE}" \
+            origin \
+            "${BASE_SHA}:refs/heads/${BASE_BRANCH}" \
+            "${ANCHOR_SHA}:refs/heads/${ANCHOR_BRANCH}" \
+            "${BRANCH}:refs/heads/${BRANCH}"
 
       - name: Create or update preview pull request
         if: ${{ steps.replay.outputs.result == 'success' }}
@@ -395,6 +449,20 @@ jobs:
           set -euo pipefail
 
           BODY_FILE="$(mktemp)"
+          MARKER_JSON="$(jq -nc \
+            --arg tag "${TAG}" \
+            --arg base_sha "${BASE_SHA}" \
+            --arg anchor_sha "${ANCHOR_SHA}" \
+            --arg effective_base_sha "${EFFECTIVE_BASE_SHA}" \
+            --arg head_sha "${HEAD_SHA}" \
+            '{
+              version: 1,
+              tag: $tag,
+              base_sha: $base_sha,
+              anchor_sha: $anchor_sha,
+              effective_base_sha: $effective_base_sha,
+              head_sha: $head_sha
+            }')"
           {
             echo "Clean upstream release preview for \`${TAG}\`."
             echo
@@ -414,6 +482,8 @@ jobs:
             echo "**Do not use the GitHub merge button.**"
             echo
             echo "After reviewing the diff and checks, comment \`/promote-fork\`. The promote workflow will force-with-lease rewrite \`${BASE_BRANCH}\`, move \`${ANCHOR_BRANCH}\` to the effective upstream baseline, close this PR, and delete \`${BRANCH}\`."
+            echo
+            echo "<!-- fork-sync-source ${MARKER_JSON} -->"
           } > "${BODY_FILE}"
 
           PR_NUMBER="$(gh pr list \
