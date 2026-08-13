@@ -5,7 +5,6 @@ on:
     types: [created]
 
 permissions:
-  actions: write
   contents: write
   pull-requests: write
   issues: write
@@ -252,10 +251,6 @@ jobs:
             ANCHOR_DESCRIPTION="\`${TAG}\` (\`${TAG_SHA}\`)"
           fi
 
-          gh workflow run "Docker Image" \
-            --repo "${GITHUB_REPOSITORY}" \
-            --ref "${BASE_BRANCH}"
-
           if ISSUE_NUMBERS="$(gh issue list \
             --repo "${GITHUB_REPOSITORY}" \
             --label "${CONFLICT_ISSUE_LABEL}" \
@@ -278,7 +273,7 @@ jobs:
             echo "::warning::Failed to list stale conflict issues after promotion."
           fi
 
-          PROMOTE_COMMENT="Promoted \`${HEAD_REF}\` to \`${BASE_BRANCH}\` at \`${HEAD_SHA}\` and moved \`${ANCHOR_BRANCH}\` to ${ANCHOR_DESCRIPTION}. Docker publishing has been dispatched from the updated \`${BASE_BRANCH}\` branch."
+          PROMOTE_COMMENT="Promoted \`${HEAD_REF}\` to \`${BASE_BRANCH}\` at \`${HEAD_SHA}\` and moved \`${ANCHOR_BRANCH}\` to ${ANCHOR_DESCRIPTION}. The \`${BASE_BRANCH}\` push triggers Docker publishing."
           PR_STATE="$(gh pr view "${PR_NUMBER}" \
             --repo "${GITHUB_REPOSITORY}" \
             --json state \
