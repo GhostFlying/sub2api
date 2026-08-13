@@ -44,7 +44,8 @@ branch and not a Docker publishing source.
     force-with-lease rewrites `fork`, moves `upstream-release` to the promoted
     effective upstream baseline, closes stale conflict reports, closes the PR,
     and deletes the sync branch.
-12. The Docker workflow publishes `ghcr.io/ghostflying/sub2api:fork` only when
-   `fork` is updated.
+12. Updating `fork` triggers the Docker workflow that publishes
+    `ghcr.io/ghostflying/sub2api:fork`. Promotion must not dispatch a second
+    Docker run because it can race the push run with a stale workflow SHA.
 13. Keep GitHub CLI pull request commands pinned to `${GITHUB_REPOSITORY}` so
     fork workflows do not accidentally target the upstream repository.
