@@ -50,7 +50,9 @@ of the raw tag commit.
    effective baseline, or head SHA no longer matches.
 10. The promote workflow must atomically rewrite `fork` to the reviewed sync
    branch and move `upstream-release` to the promoted effective baseline.
-11. Docker publishing runs from the updated `fork` branch.
+11. Updating `fork` triggers Docker publishing. Do not dispatch a second
+    Docker workflow from promotion because it can race the push-triggered run
+    with a stale workflow SHA.
 
 Do not use the GitHub merge button for generated sync PRs.
 
