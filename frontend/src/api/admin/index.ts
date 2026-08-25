@@ -74,7 +74,7 @@ export const adminAPI = {
   riskControl: riskControlAPI,
   compliance: adminComplianceAPI,
   audit: auditAPI,
-	plugins: pluginsAPI,
+  plugins: pluginsAPI,
   backgroundTasks: backgroundTasksAPI
 }
 
@@ -111,7 +111,7 @@ export {
   riskControlAPI,
   adminComplianceAPI,
   auditAPI,
-	pluginsAPI,
+  pluginsAPI,
   backgroundTasksAPI
 }
 
