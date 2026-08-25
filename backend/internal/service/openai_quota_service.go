@@ -463,9 +463,15 @@ func (s *OpenAIQuotaService) resetCredit(ctx context.Context, accountID int64, r
 			}
 			status := resp.StatusCode
 			definitiveNoConsumption := openAIQuotaResetDefinitiveRejection(status)
-			body := truncate(s.redactQuotaErrorBody(callCtx, accountID, resp.String()), 240)
-			slog.Warn("openai_quota_reset_failed", "account_id", accountID, "status", status, "body", body)
-			appErr := infraerrors.Newf(mapUpstreamStatus(status), "OPENAI_QUOTA_RESET_UPSTREAM_ERROR", "upstream returned %d: %s", status, body)
+			var appErr error
+			if creditID != "" {
+				slog.Warn("openai_quota_targeted_reset_failed", "account_id", accountID, "status", status)
+				appErr = infraerrors.Newf(mapUpstreamStatus(status), "OPENAI_QUOTA_RESET_UPSTREAM_ERROR", "upstream returned %d", status)
+			} else {
+				body := truncate(s.redactQuotaErrorBody(callCtx, accountID, resp.String()), 240)
+				slog.Warn("openai_quota_reset_failed", "account_id", accountID, "status", status, "body", body)
+				appErr = infraerrors.Newf(mapUpstreamStatus(status), "OPENAI_QUOTA_RESET_UPSTREAM_ERROR", "upstream returned %d: %s", status, body)
+			}
 			return nil, &OpenAIQuotaResetAttemptError{
 				Kind:                    OpenAIQuotaResetErrorUpstream,
 				UpstreamStatus:          status,
