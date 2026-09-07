@@ -434,6 +434,42 @@ func TestBuildCodexModelsManifestUsesGPT6AstraInstructions(t *testing.T) {
 	))
 }
 
+func TestConfiguredCodexModelDescriptorUsesBundledMultiAgentDefaults(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name          string
+		modelID       string
+		wantVersion   any
+		wantEffort    string
+		wantHasEffort bool
+	}{
+		{name: "Astra", modelID: "gpt-6-astra", wantVersion: "v2", wantEffort: "xhigh", wantHasEffort: true},
+		{name: "Astra public alias", modelID: "gpt-6", wantVersion: "v2", wantEffort: "xhigh", wantHasEffort: true},
+		{name: "Sol", modelID: "gpt-5.6-sol", wantVersion: "v2"},
+		{name: "Sol public alias", modelID: "gpt-5.6", wantVersion: "v2"},
+		{name: "Terra", modelID: "openai/gpt-5.6-terra", wantVersion: "v2"},
+		{name: "Luna", modelID: "gpt-5.6-luna", wantVersion: "v1"},
+		{name: "unknown Sol-like family", modelID: "gpt-5.6-solar"},
+		{name: "unknown GPT-5.6 family", modelID: "gpt-5.6-nebula"},
+		{name: "third-party model", modelID: "company-coding-model"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			descriptor := newConfiguredCodexModelDescriptor(tt.modelID)
+			require.Equal(t, tt.wantVersion, descriptor.MultiAgentVersion)
+			if !tt.wantHasEffort {
+				require.Nil(t, descriptor.MultiAgentReasoningEffort)
+				return
+			}
+			require.NotNil(t, descriptor.MultiAgentReasoningEffort)
+			require.Equal(t, tt.wantEffort, *descriptor.MultiAgentReasoningEffort)
+		})
+	}
+}
+
 func effortsFromConfiguredCodexLevels(levels []configuredCodexReasoningLevel) []string {
 	efforts := make([]string, 0, len(levels))
 	for _, level := range levels {
