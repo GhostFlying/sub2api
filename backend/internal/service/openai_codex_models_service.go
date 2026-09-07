@@ -512,11 +512,6 @@ func newConfiguredCodexModelDescriptor(modelID string) configuredCodexModelDescr
 				descriptor.MaxContextWindow = configuredCodexGPT56MaxContext
 			}
 			if isOpenAIGPT6AstraModel(modelID) {
-				// Codex resolves the Ultra workflow to this effort before inference.
-				// openai/codex a9896da3: codex-rs/models-manager/models.json.
-				multiAgentEffort := "xhigh"
-				descriptor.MultiAgentReasoningEffort = &multiAgentEffort
-				descriptor.MultiAgentVersion = "v2"
 				descriptor.ContextWindow = configuredCodexGPT6AstraContext
 				descriptor.MaxContextWindow = configuredCodexGPT6AstraContext
 			}
@@ -527,8 +522,39 @@ func newConfiguredCodexModelDescriptor(modelID string) configuredCodexModelDescr
 			descriptor.DefaultVerbosity = &defaultVerbosity
 		}
 	}
+	applyKnownCodexMultiAgentDefaults(&descriptor, modelID)
 
 	return descriptor
+}
+
+func applyKnownCodexMultiAgentDefaults(descriptor *configuredCodexModelDescriptor, modelID string) {
+	if descriptor == nil {
+		return
+	}
+
+	// Keep locally generated catalogs aligned with the models bundled by Codex.
+	// Explicit upstream declarations are applied later and still win, including
+	// an explicit null. openai/codex a9896da3: models-manager/models.json.
+	normalized := normalizeKnownOpenAICodexModel(modelID)
+	switch normalized {
+	case "gpt-6-astra":
+		if !isOpenAIGPT6AstraModel(modelID) {
+			return
+		}
+		multiAgentEffort := "xhigh"
+		descriptor.MultiAgentReasoningEffort = &multiAgentEffort
+		descriptor.MultiAgentVersion = "v2"
+	case "gpt-5.6-sol", "gpt-5.6-terra":
+		if !isOpenAIGPT56Model(modelID) {
+			return
+		}
+		descriptor.MultiAgentVersion = "v2"
+	case "gpt-5.6-luna":
+		if !isOpenAIGPT56Model(modelID) {
+			return
+		}
+		descriptor.MultiAgentVersion = "v1"
+	}
 }
 
 func configuredCodexServiceTiersForModel(modelID string) []configuredCodexServiceTier {
