@@ -408,6 +408,86 @@ func TestCodexModelsUnmappedParentAndSparkShadowHonorCustomListAndETag(t *testin
 	require.Empty(t, upstream.calls())
 }
 
+func TestCodexModelsConfiguredCatalogUsesBundledMultiAgentDefaultsAndFinalETag(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	const groupID int64 = 45
+	repo := &codexModelsFailoverAccountRepo{accounts: []service.Account{{
+		ID:          1,
+		Name:        "configured-openai",
+		Platform:    service.PlatformOpenAI,
+		Type:        service.AccountTypeAPIKey,
+		Status:      service.StatusActive,
+		Schedulable: true,
+		Concurrency: 1,
+		Credentials: map[string]any{
+			"api_key":  "sk-configured",
+			"base_url": "https://upstream.example/v1",
+			"model_mapping": map[string]any{
+				"gpt-6":         "gpt-6-astra",
+				"gpt-5.6":       "gpt-5.6-sol",
+				"gpt-5.6-terra": "gpt-5.6-terra",
+				"gpt-5.6-luna":  "gpt-5.6-luna",
+			},
+		},
+	}}}
+	upstream := &codexModelsFailoverHTTPUpstream{firstStatus: http.StatusNotFound}
+	gatewayService := service.NewOpenAIGatewayService(
+		repo,
+		nil, nil, nil, nil, nil, nil, &config.Config{RunMode: config.RunModeSimple}, nil, nil, nil, nil, nil,
+		upstream,
+		nil, nil, nil, nil, nil, nil, nil, nil,
+	)
+	handler := &OpenAIGatewayHandler{gatewayService: gatewayService}
+	group := &service.Group{ID: groupID, Platform: service.PlatformOpenAI}
+
+	first := performCodexModelsRequestForGroup(t, handler, group, "")
+	require.Equal(t, http.StatusOK, first.Code, first.Body.String())
+	require.Empty(t, upstream.calls(), "configured catalog must return before upstream discovery")
+	require.NotEmpty(t, first.Header().Get("ETag"))
+
+	var envelope struct {
+		Models []struct {
+			Slug                      string  `json:"slug"`
+			MultiAgentVersion         *string `json:"multi_agent_version"`
+			MultiAgentReasoningEffort *string `json:"multi_agent_reasoning_effort"`
+		} `json:"models"`
+	}
+	require.NoError(t, json.Unmarshal(first.Body.Bytes(), &envelope))
+	models := make(map[string]struct {
+		version string
+		effort  string
+	}, len(envelope.Models))
+	for _, model := range envelope.Models {
+		version := ""
+		if model.MultiAgentVersion != nil {
+			version = *model.MultiAgentVersion
+		}
+		effort := ""
+		if model.MultiAgentReasoningEffort != nil {
+			effort = *model.MultiAgentReasoningEffort
+		}
+		models[model.Slug] = struct {
+			version string
+			effort  string
+		}{version: version, effort: effort}
+	}
+	require.Equal(t, map[string]struct {
+		version string
+		effort  string
+	}{
+		"gpt-6":         {version: "v2", effort: "xhigh"},
+		"gpt-5.6":       {version: "v2"},
+		"gpt-5.6-terra": {version: "v2"},
+		"gpt-5.6-luna":  {version: "v1"},
+	}, models)
+
+	second := performCodexModelsRequestForGroup(t, handler, group, first.Header().Get("ETag"))
+	require.Equal(t, http.StatusNotModified, second.Code, second.Body.String())
+	require.Empty(t, second.Body.Bytes())
+	require.Equal(t, first.Header().Get("ETag"), second.Header().Get("ETag"))
+	require.Empty(t, upstream.calls(), "ETag hit must stay on the configured-catalog path")
+}
+
 func TestCompositeCodexModelsReusesExistingManifestSelection(t *testing.T) {
 	handler, upstream, groupID := newCodexModelsFailoverTestHandler(http.StatusServiceUnavailable)
 
