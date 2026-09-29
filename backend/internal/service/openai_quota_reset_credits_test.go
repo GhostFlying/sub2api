@@ -64,7 +64,7 @@ func TestResetCreditByIDAlwaysSendsStableRequestAndCreditPair(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	svc := NewOpenAIQuotaService(repo, nil, tokenProvider, newQuotaRedirectingFactory(srv))
+	svc := NewOpenAIQuotaService(repo, nil, tokenProvider, newQuotaRedirectingFactory(srv), nil)
 	first, err := svc.ResetCreditByID(context.Background(), account.ID, "request-fixed", "credit-fixed")
 	require.NoError(t, err)
 	require.Equal(t, "reset", first.Code)
@@ -91,7 +91,7 @@ func TestResetCreditByIDTreatsHTTP408AsAmbiguousAndRetryable(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	svc := NewOpenAIQuotaService(repo, nil, tokenProvider, newQuotaRedirectingFactory(srv))
+	svc := NewOpenAIQuotaService(repo, nil, tokenProvider, newQuotaRedirectingFactory(srv), nil)
 	_, err := svc.ResetCreditByID(context.Background(), account.ID, "request-fixed", "credit-fixed")
 	require.Error(t, err)
 	var attemptErr *OpenAIQuotaResetAttemptError
