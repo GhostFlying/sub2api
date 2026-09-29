@@ -276,6 +276,7 @@ func TestOpenAIQuotaResetHandlerRealHTTPTimeoutThenAlreadyRedeemed(t *testing.T)
 		nil,
 		NewOpenAITokenProvider(accountRepo, tokenCache, nil),
 		newQuotaRedirectingFactory(server),
+		nil,
 	)
 	quota.upstreamTimeout = 25 * time.Millisecond
 	expiresAt := time.Now().Add(10 * time.Minute).UTC().Truncate(time.Second)
