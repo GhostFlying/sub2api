@@ -1,13 +1,25 @@
 name: Promote Fork
 
 on:
-  issue_comment:
-    types: [created]
+  workflow_run:
+    workflows: [CI, Security Scan]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'Candidate PR number to retry; normally dispatched automatically by sync.'
+        required: true
+        type: string
+      expected_head:
+        description: 'Optional exact candidate SHA captured by sync.'
+        required: false
+        type: string
 
 permissions:
   contents: write
   pull-requests: write
   issues: write
+  actions: read
   checks: read
   statuses: read
 
@@ -16,158 +28,78 @@ env:
   ANCHOR_BRANCH: upstream-release
   UPSTREAM_REPOSITORY: Wei-Shaw/sub2api
   CONFLICT_ISSUE_LABEL: sync-upstream-conflict
-  REQUIRED_CHECKS: test frontend golangci-lint backend-security frontend-security
+  REQUIRED_CHECKS: test frontend golangci-lint fork-maintenance backend-security frontend-security
 
 jobs:
   promote:
-    if: ${{ github.event.issue.pull_request && github.event.comment.body == '/promote-fork' }}
+    if: >-
+      github.repository == 'GhostFlying/sub2api' &&
+      ((github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/fork') ||
+       (github.event_name == 'workflow_run' &&
+        github.event.workflow_run.head_repository.full_name == github.repository &&
+        startsWith(github.event.workflow_run.head_branch, 'sync/upstream-') &&
+        (github.event.workflow_run.event == 'push' || github.event.workflow_run.event == 'workflow_dispatch')))
     concurrency:
       group: fork-maintenance
       cancel-in-progress: false
     runs-on: ubuntu-latest
     steps:
-      - name: Validate promote request
-        id: request
-        env:
-          GH_TOKEN: ${{ secrets.FORK_MAINTENANCE_TOKEN }}
-          COMMENT_BODY: ${{ github.event.comment.body }}
-          COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
-          PR_NUMBER: ${{ github.event.issue.number }}
-        run: |
-          set -euo pipefail
-
-          COMMAND="$(printf '%s' "${COMMENT_BODY}" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-          if [ "${COMMAND}" != "/promote-fork" ]; then
-            gh pr comment "${PR_NUMBER}" \
-              --repo "${GITHUB_REPOSITORY}" \
-              --body "Refusing to promote: the promote command must be exactly \`/promote-fork\`."
-            exit 1
-          fi
-
-          PERMISSION="$(gh api \
-            "repos/${GITHUB_REPOSITORY}/collaborators/${COMMENT_AUTHOR}/permission" \
-            --jq .permission)"
-
-          case "${PERMISSION}" in
-            admin|maintain|write)
-              ;;
-            *)
-              gh pr comment "${PR_NUMBER}" \
-                --repo "${GITHUB_REPOSITORY}" \
-                --body "Refusing to promote: @${COMMENT_AUTHOR} has \`${PERMISSION}\` permission, but \`write\`, \`maintain\`, or \`admin\` is required."
-              exit 1
-              ;;
-          esac
-
-          gh pr view "${PR_NUMBER}" \
-            --repo "${GITHUB_REPOSITORY}" \
-            --json baseRefName,body,headRefName,headRefOid,state \
-            > /tmp/pr.json
-
-          STATE="$(jq -r .state /tmp/pr.json)"
-          BASE_REF="$(jq -r .baseRefName /tmp/pr.json)"
-          HEAD_REF="$(jq -r .headRefName /tmp/pr.json)"
-          HEAD_SHA="$(jq -r .headRefOid /tmp/pr.json)"
-          PR_BODY="$(jq -r .body /tmp/pr.json)"
-
-          if [ "${STATE}" != "OPEN" ]; then
-            gh pr comment "${PR_NUMBER}" \
-              --repo "${GITHUB_REPOSITORY}" \
-              --body "Refusing to promote: PR #${PR_NUMBER} is ${STATE}, not OPEN."
-            exit 1
-          fi
-
-          if [ "${BASE_REF}" != "${BASE_BRANCH}" ] || [[ "${HEAD_REF}" != sync/upstream-* ]]; then
-            gh pr comment "${PR_NUMBER}" \
-              --repo "${GITHUB_REPOSITORY}" \
-              --body "Refusing to promote: expected \`sync/upstream-* -> ${BASE_BRANCH}\`, got \`${HEAD_REF} -> ${BASE_REF}\`."
-            exit 1
-          fi
-
-          TAG="${HEAD_REF#sync/upstream-}"
-          MARKER_JSON="$(sed -n \
-            's/^<!-- fork-sync-source \(.*\) -->$/\1/p' \
-            <<<"${PR_BODY}" |
-          tail -n 1)"
-          if ! jq -e \
-            --arg tag "${TAG}" \
-            --arg head_sha "${HEAD_SHA}" \
-            '
-              .version == 1 and
-              .tag == $tag and
-              (.base_sha | test("^[0-9a-f]{40}$")) and
-              (.anchor_sha | test("^[0-9a-f]{40}$")) and
-              (.effective_base_sha | test("^[0-9a-f]{40}$")) and
-              .head_sha == $head_sha
-            ' <<<"${MARKER_JSON}" >/dev/null 2>&1; then
-            gh pr comment "${PR_NUMBER}" \
-              --repo "${GITHUB_REPOSITORY}" \
-              --body "Refusing to promote: the preview source-ref marker is missing or does not match the reviewed head. Re-run the sync workflow and review the regenerated preview."
-            exit 1
-          fi
-
-          SOURCE_BASE_SHA="$(jq -r .base_sha <<<"${MARKER_JSON}")"
-          SOURCE_ANCHOR_SHA="$(jq -r .anchor_sha <<<"${MARKER_JSON}")"
-          SOURCE_EFFECTIVE_BASE_SHA="$(jq -r .effective_base_sha <<<"${MARKER_JSON}")"
-
-          gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/check-runs" \
-            --paginate \
-            --jq '.check_runs[] | {name,status,conclusion,html_url,started_at,completed_at}' \
-            > /tmp/check-runs.jsonl
-
-          MISSING_CHECKS=""
-          BAD_CHECKS=""
-          for REQUIRED_CHECK in ${REQUIRED_CHECKS}; do
-            CHECK_JSON="$(jq -s --arg name "${REQUIRED_CHECK}" '
-              map(select(.name == $name))
-              | sort_by(.started_at // .completed_at // "")
-              | last // empty
-            ' /tmp/check-runs.jsonl)"
-
-            if [ -z "${CHECK_JSON}" ]; then
-              MISSING_CHECKS="${MISSING_CHECKS}"$'\n'"- ${REQUIRED_CHECK}: missing"
-              continue
-            fi
-
-            STATUS="$(jq -r '.status // "unknown"' <<<"${CHECK_JSON}")"
-            CONCLUSION="$(jq -r '.conclusion // ""' <<<"${CHECK_JSON}")"
-            URL="$(jq -r '.html_url // ""' <<<"${CHECK_JSON}")"
-
-            if [ "${STATUS}" != "completed" ] || { [ "${CONCLUSION}" != "success" ] && [ "${CONCLUSION}" != "neutral" ] && [ "${CONCLUSION}" != "skipped" ]; }; then
-              BAD_CHECKS="${BAD_CHECKS}"$'\n'"- ${REQUIRED_CHECK}: ${STATUS} ${CONCLUSION} ${URL}"
-            fi
-          done
-
-          if [ -n "${MISSING_CHECKS}" ]; then
-            gh pr comment "${PR_NUMBER}" \
-              --repo "${GITHUB_REPOSITORY}" \
-              --body "Refusing to promote: required checks have not reported yet.${MISSING_CHECKS}"
-            exit 1
-          fi
-
-          if [ -n "${BAD_CHECKS}" ]; then
-            gh pr comment "${PR_NUMBER}" \
-              --repo "${GITHUB_REPOSITORY}" \
-              --body "Refusing to promote: required checks are not all passing yet.${BAD_CHECKS}"
-            exit 1
-          fi
-
-          echo "pr_number=${PR_NUMBER}" >> "${GITHUB_OUTPUT}"
-          echo "head_ref=${HEAD_REF}" >> "${GITHUB_OUTPUT}"
-          echo "head_sha=${HEAD_SHA}" >> "${GITHUB_OUTPUT}"
-          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
-          echo "source_base_sha=${SOURCE_BASE_SHA}" >> "${GITHUB_OUTPUT}"
-          echo "source_anchor_sha=${SOURCE_ANCHOR_SHA}" >> "${GITHUB_OUTPUT}"
-          echo "source_effective_base_sha=${SOURCE_EFFECTIVE_BASE_SHA}" >> "${GITHUB_OUTPUT}"
-
-      - name: Checkout fork branch
+      - name: Checkout trusted fork branch
         uses: actions/checkout@v6
         with:
           ref: ${{ env.BASE_BRANCH }}
           fetch-depth: 0
           token: ${{ secrets.FORK_MAINTENANCE_TOKEN }}
 
+      - name: Validate automatic promotion
+        id: request
+        env:
+          GH_TOKEN: ${{ secrets.FORK_MAINTENANCE_TOKEN }}
+          INPUT_PR_NUMBER: ${{ inputs.pr_number }}
+          EVENT_HEAD_REF: ${{ github.event.workflow_run.head_branch }}
+          EXPECTED_HEAD: ${{ github.event.workflow_run.head_sha || inputs.expected_head }}
+        run: |
+          set -euo pipefail
+
+          PR_NUMBER="${INPUT_PR_NUMBER}"
+          if [ -z "${PR_NUMBER}" ]; then
+            PR_NUMBER="$(gh pr list \
+              --repo "${GITHUB_REPOSITORY}" \
+              --base "${BASE_BRANCH}" \
+              --head "${EVENT_HEAD_REF}" \
+              --state open --json number --jq '.[0].number // empty')"
+          fi
+          if [ -z "${PR_NUMBER}" ]; then
+            echo "No open candidate remains for this completed run."
+            echo "ready=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          [[ "${PR_NUMBER}" =~ ^[1-9][0-9]*$ ]]
+          gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" > /tmp/pr.json
+          HEAD_SHA="$(jq -r .head.sha /tmp/pr.json)"
+          [[ "${HEAD_SHA}" =~ ^[0-9a-f]{40}$ ]]
+          gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/check-runs" \
+            --paginate --jq '.check_runs[]' > /tmp/check-runs.jsonl
+          python .github/scripts/fork_promotion.py inspect \
+            --pr /tmp/pr.json --checks /tmp/check-runs.jsonl \
+            --repository "${GITHUB_REPOSITORY}" \
+            --required-checks "${REQUIRED_CHECKS}" \
+            --expected-head "${EXPECTED_HEAD}" | tee /tmp/fork-promotion-result.json
+          {
+            echo '### Automatic fork promotion'
+            echo '```json'
+            cat /tmp/fork-promotion-result.json
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Report failed candidate checks
+        if: steps.request.outputs.result == 'blocked'
+        run: |
+          echo "::error::Required candidate checks failed; production refs are unchanged."
+          exit 1
+
       - name: Promote generated fork
+        if: steps.request.outputs.ready == 'true'
         env:
           GH_TOKEN: ${{ secrets.FORK_MAINTENANCE_TOKEN }}
           PR_NUMBER: ${{ steps.request.outputs.pr_number }}
@@ -177,8 +109,15 @@ jobs:
           SOURCE_BASE_SHA: ${{ steps.request.outputs.source_base_sha }}
           SOURCE_ANCHOR_SHA: ${{ steps.request.outputs.source_anchor_sha }}
           SOURCE_EFFECTIVE_BASE_SHA: ${{ steps.request.outputs.source_effective_base_sha }}
+          SOURCE_TAG_SHA: ${{ steps.request.outputs.source_tag_sha }}
         run: |
           set -euo pipefail
+
+          gh api "repos/${UPSTREAM_REPOSITORY}/releases/tags/${TAG}" \
+            --jq '.' > /tmp/promotion-release.jsonl
+          SELECTED_TAG="$(python .github/scripts/fork_promotion.py select-release \
+            --releases /tmp/promotion-release.jsonl --requested "${TAG}")"
+          test "${SELECTED_TAG}" = "${TAG}"
 
           git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
           git fetch upstream --tags --force \
@@ -190,6 +129,10 @@ jobs:
 
           VERSION="${TAG#v}"
           TAG_SHA="$(git rev-parse "${TAG}^{commit}")"
+          if [ "${TAG_SHA}" != "${SOURCE_TAG_SHA}" ]; then
+            echo "::error::The upstream release tag changed after candidate generation."
+            exit 1
+          fi
           EFFECTIVE_BASE_SHA="${TAG_SHA}"
           VERSION_SYNC_SHA=""
           REMOTE_BASE_SHA="$(git rev-parse "origin/${BASE_BRANCH}^{commit}")"
@@ -197,6 +140,9 @@ jobs:
           REMOTE_HEAD_SHA="$(git rev-parse "origin/${HEAD_REF}^{commit}")"
 
           while IFS= read -r CANDIDATE; do
+            if ! git merge-base --is-ancestor "${TAG_SHA}" "${CANDIDATE}"; then
+              continue
+            fi
             SUBJECT="$(git log -1 --format=%s "${CANDIDATE}")"
             if [ "${SUBJECT}" != "chore: sync VERSION to ${VERSION} [skip ci]" ]; then
               continue
@@ -224,26 +170,37 @@ jobs:
             exit 1
           fi
 
-          if [ "${REMOTE_BASE_SHA}" != "${SOURCE_BASE_SHA}" ] ||
-            [ "${REMOTE_ANCHOR_SHA}" != "${SOURCE_ANCHOR_SHA}" ] ||
-            [ "${EFFECTIVE_BASE_SHA}" != "${SOURCE_EFFECTIVE_BASE_SHA}" ]; then
-            gh pr comment "${PR_NUMBER}" \
-              --repo "${GITHUB_REPOSITORY}" \
-              --body "Refusing to promote: the preview was generated from stale fork-maintenance refs or a different effective baseline. Re-run the sync workflow and review the regenerated preview."
-            echo "Preview ${BASE_BRANCH}: ${SOURCE_BASE_SHA}; current: ${REMOTE_BASE_SHA}"
-            echo "Preview ${ANCHOR_BRANCH}: ${SOURCE_ANCHOR_SHA}; current: ${REMOTE_ANCHOR_SHA}"
-            echo "Preview effective baseline: ${SOURCE_EFFECTIVE_BASE_SHA}; current: ${EFFECTIVE_BASE_SHA}"
+          if [ "${EFFECTIVE_BASE_SHA}" != "${SOURCE_EFFECTIVE_BASE_SHA}" ] ||
+            ! git merge-base --is-ancestor "${EFFECTIVE_BASE_SHA}" "origin/${HEAD_REF}"; then
+            echo "::error::Candidate effective baseline changed or is not its ancestor."
             exit 1
           fi
 
-          git push --atomic \
-            --force-with-lease="refs/heads/${BASE_BRANCH}:${SOURCE_BASE_SHA}" \
-            --force-with-lease="refs/heads/${ANCHOR_BRANCH}:${SOURCE_ANCHOR_SHA}" \
-            --force-with-lease="refs/heads/${HEAD_REF}:${HEAD_SHA}" \
-            origin \
-            "${HEAD_SHA}:refs/heads/${BASE_BRANCH}" \
-            "${EFFECTIVE_BASE_SHA}:refs/heads/${ANCHOR_BRANCH}" \
-            "${HEAD_SHA}:refs/heads/${HEAD_REF}"
+          if [ "${REMOTE_BASE_SHA}" = "${HEAD_SHA}" ] &&
+            [ "${REMOTE_ANCHOR_SHA}" = "${EFFECTIVE_BASE_SHA}" ]; then
+            echo "Candidate already promoted; completing cleanup without updating refs."
+          else
+            if [ "${REMOTE_BASE_SHA}" != "${SOURCE_BASE_SHA}" ] ||
+              [ "${REMOTE_ANCHOR_SHA}" != "${SOURCE_ANCHOR_SHA}" ]; then
+              echo "::error::Candidate source refs are stale; waiting for sync to regenerate it."
+              exit 1
+            fi
+
+            git push --atomic \
+              --force-with-lease="refs/heads/${BASE_BRANCH}:${SOURCE_BASE_SHA}" \
+              --force-with-lease="refs/heads/${ANCHOR_BRANCH}:${SOURCE_ANCHOR_SHA}" \
+              --force-with-lease="refs/heads/${HEAD_REF}:${HEAD_SHA}" \
+              origin \
+              "${HEAD_SHA}:refs/heads/${BASE_BRANCH}" \
+              "${EFFECTIVE_BASE_SHA}:refs/heads/${ANCHOR_BRANCH}" \
+              "${HEAD_SHA}:refs/heads/${HEAD_REF}"
+          fi
+
+          git fetch origin \
+            "+refs/heads/${BASE_BRANCH}:refs/remotes/origin/${BASE_BRANCH}" \
+            "+refs/heads/${ANCHOR_BRANCH}:refs/remotes/origin/${ANCHOR_BRANCH}"
+          test "$(git rev-parse "origin/${BASE_BRANCH}")" = "${HEAD_SHA}"
+          test "$(git rev-parse "origin/${ANCHOR_BRANCH}")" = "${EFFECTIVE_BASE_SHA}"
 
           if [ -n "${VERSION_SYNC_SHA}" ]; then
             ANCHOR_DESCRIPTION="effective baseline \`${EFFECTIVE_BASE_SHA}\` for \`${TAG}\`, including upstream VERSION sync commit \`${VERSION_SYNC_SHA}\`"
@@ -292,4 +249,5 @@ jobs:
               --body "${PROMOTE_COMMENT}" || true
           fi
 
-          git push origin ":refs/heads/${HEAD_REF}" || true
+          git push --force-with-lease="refs/heads/${HEAD_REF}:${HEAD_SHA}" \
+            origin ":refs/heads/${HEAD_REF}" || true
