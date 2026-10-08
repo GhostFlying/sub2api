@@ -4,6 +4,7 @@
     <div
       v-if="windowStats && (windowStats.requests > 0 || windowStats.tokens > 0)"
       class="mb-0.5 flex items-center"
+      :title="windowStatsTooltip"
     >
       <div class="flex items-center gap-1.5 text-[9px] text-gray-500 dark:text-gray-400">
         <span class="rounded bg-gray-100 px-1.5 py-0.5 dark:bg-gray-800">
@@ -41,7 +42,7 @@
       </span>
 
       <!-- Progress bar container -->
-      <div class="h-1.5 w-8 shrink-0 overflow-hidden rounded-full bg-gray-200 dark:bg-gray-700">
+      <div v-if="quotaAvailable !== false" class="h-1.5 w-8 shrink-0 overflow-hidden rounded-full bg-gray-200 dark:bg-gray-700">
         <div
           :class="['h-full transition-all duration-300', barClass]"
           :style="{ width: barWidth }"
@@ -49,12 +50,15 @@
       </div>
 
       <!-- Percentage -->
-      <span :class="['w-[32px] shrink-0 text-right text-[10px] font-medium', textClass]">
+      <span v-if="quotaAvailable !== false" :class="['w-[32px] shrink-0 text-right text-[10px] font-medium', textClass]">
         {{ displayPercent }}
       </span>
 
       <!-- Reset time -->
-      <span v-if="shouldShowResetTime" class="shrink-0 text-[10px] text-gray-400">
+      <span v-if="quotaAvailable === false" class="text-[10px] text-gray-400">
+        {{ t('admin.accounts.usageWindow.quotaUnknown') }}
+      </span>
+      <span v-if="quotaAvailable !== false && shouldShowResetTime" class="shrink-0 text-[10px] text-gray-400">
         {{ formatResetTime }}
       </span>
     </div>
@@ -75,16 +79,22 @@ const props = withDefaults(
     resetsAt?: string | null
     color: 'indigo' | 'emerald' | 'purple' | 'amber'
     windowStats?: WindowStats | null
+    windowStatsPeriod?: 'cycle' | 'last_7_days'
+    quotaAvailable?: boolean
     estimatedTotalCost?: number | null
     showNowWhenIdle?: boolean
     remainingCapacity?: boolean
     /** fixed: 定宽居中徽章（账号页纵向对齐）；auto: 限宽截断左对齐（监控页组合标签） */
     labelWidth?: 'fixed' | 'auto'
   }>(),
-  { labelWidth: 'fixed' }
+  { labelWidth: 'fixed', quotaAvailable: true }
 )
 
 const { t } = useI18n()
+
+const windowStatsTooltip = computed(() => props.windowStatsPeriod
+  ? t(`admin.accounts.usageWindow.localStats${props.windowStatsPeriod === 'cycle' ? 'Cycle' : 'Last7Days'}`)
+  : undefined)
 
 // Reactive clock for countdown — only runs when a reset time is shown,
 // to avoid creating many idle timers across large account lists.
