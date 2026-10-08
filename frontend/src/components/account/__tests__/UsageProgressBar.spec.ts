@@ -203,4 +203,49 @@ describe('UsageProgressBar', () => {
     expect(percent.classes()).toContain('w-[32px]')
     expect(percent.classes()).toContain('text-right')
   })
+
+  it.each(['cycle', 'last_7_days'] as const)('local %s stats remain visible with unknown official quota', (period) => {
+    const wrapper = mount(UsageProgressBar, {
+      props: {
+        label: '7d', utilization: 0, color: 'emerald', quotaAvailable: false,
+        resetsAt: '2026-03-17T02:30:00Z', windowStatsPeriod: period,
+        windowStats: { requests: 12, tokens: 1200000, cost: 3.5, user_cost: 2.5 }
+      }
+    })
+    expect(wrapper.text()).toContain('12 req')
+    expect(wrapper.text()).toContain('1.2M')
+    expect(wrapper.text()).toContain('A $3.50')
+    expect(wrapper.text()).toContain('U $2.50')
+    expect(wrapper.text()).toContain('admin.accounts.usageWindow.quotaUnknown')
+    expect(wrapper.text()).not.toContain('0%')
+    expect(wrapper.text()).not.toContain('2h 30m')
+    expect(wrapper.find('.h-1\\.5').exists()).toBe(false)
+    expect(wrapper.get('[title]').attributes('title')).toBe(`admin.accounts.usageWindow.localStats${period === 'cycle' ? 'Cycle' : 'Last7Days'}`)
+    wrapper.unmount()
+  })
+
+  it('reported zero official quota stays visible beside cycle stats', () => {
+    const wrapper = mount(UsageProgressBar, {
+      props: {
+        label: '7d', utilization: 0, color: 'emerald', quotaAvailable: true,
+        windowStatsPeriod: 'cycle', resetsAt: '2026-03-17T02:30:00Z',
+        windowStats: { requests: 1, tokens: 100, cost: 0, user_cost: 0 }
+      }
+    })
+    expect(wrapper.text()).toContain('0%')
+    expect(wrapper.text()).toContain('2h 30m')
+    expect(wrapper.text()).not.toContain('admin.accounts.usageWindow.quotaUnknown')
+    wrapper.unmount()
+  })
+
+  it('missing statistics do not render a zero usage row', () => {
+    const wrapper = mount(UsageProgressBar, {
+      props: { label: '7d', utilization: 40, color: 'emerald', quotaAvailable: true }
+    })
+    expect(wrapper.text()).toContain('40%')
+    expect(wrapper.text()).not.toContain('req')
+    expect(wrapper.text()).not.toContain('A $')
+    wrapper.unmount()
+  })
+
 })

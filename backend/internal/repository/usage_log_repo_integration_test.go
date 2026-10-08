@@ -1308,6 +1308,42 @@ func (s *UsageLogRepoSuite) TestGetAccountWindowStats() {
 	s.Require().Equal(int64(70), stats.Tokens) // (10+20) + (15+25)
 }
 
+// TestGetAccountWindowStats_ClaudeWeeklyCycle verifies the reused SQL against real logs.
+func (s *UsageLogRepoSuite) TestGetAccountWindowStats_ClaudeWeeklyCycle() {
+	user := mustCreateUser(s.T(), s.client, &service.User{Email: "claude-weekly@test.com"})
+	apiKey := mustCreateApiKey(s.T(), s.client, &service.APIKey{UserID: user.ID, Key: "sk-claude-weekly", Name: "k"})
+	account := mustCreateAccount(s.T(), s.client, &service.Account{Name: "claude-weekly"})
+	other := mustCreateAccount(s.T(), s.client, &service.Account{Name: "claude-weekly-other"})
+	now := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+	reset := now.Add(2 * 24 * time.Hour)
+	start := reset.Add(-7 * 24 * time.Hour)
+	multiplier := 2.0
+	for _, row := range []struct {
+		accountID int64
+		at        time.Time
+	}{
+		{account.ID, start.Add(-time.Second)},
+		{account.ID, start},
+		{account.ID, now.Add(-time.Minute)},
+		{other.ID, now.Add(-time.Minute)},
+	} {
+		_, err := s.repo.Create(s.ctx, &service.UsageLog{
+			UserID: user.ID, APIKeyID: apiKey.ID, AccountID: row.accountID,
+			RequestID: uuid.New().String(), Model: "claude-sonnet-4-6",
+			InputTokens: 10, OutputTokens: 20, CacheCreationTokens: 30, CacheReadTokens: 40,
+			TotalCost: 1.5, ActualCost: 0.5, AccountRateMultiplier: &multiplier, CreatedAt: row.at,
+		})
+		s.Require().NoError(err)
+	}
+	stats, err := s.repo.GetAccountWindowStats(s.ctx, account.ID, start)
+	s.Require().NoError(err)
+	s.Require().Equal(int64(2), stats.Requests)
+	s.Require().Equal(int64(200), stats.Tokens)
+	s.Require().Equal(6.0, stats.Cost)
+	s.Require().Equal(3.0, stats.StandardCost)
+	s.Require().Equal(1.0, stats.UserCost)
+}
+
 // --- GetUserUsageTrendByUserID ---
 
 func (s *UsageLogRepoSuite) TestGetUserUsageTrendByUserID() {

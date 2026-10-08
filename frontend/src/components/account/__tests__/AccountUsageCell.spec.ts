@@ -1,6 +1,7 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest'
 import { flushPromises, mount } from '@vue/test-utils'
 import AccountUsageCell from '../AccountUsageCell.vue'
+import UsageProgressBar from '../UsageProgressBar.vue'
 import type { Account } from '@/types'
 
 const { getUsage, listBackgroundTasks } = vi.hoisted(() => ({
@@ -1753,4 +1754,85 @@ describe('AccountUsageCell', () => {
     expect(wrapper.text()).not.toContain('7d S')
     expect(wrapper.text()).not.toContain('7d F')
   })
+  it.each(['oauth', 'setup-token'] as const)('Claude %s loads weekly logs passively and retains manual querying', async (type) => {
+    const stats = { requests: 12, tokens: 1200000, cost: 3.5, user_cost: 2.5 }
+    getUsage.mockResolvedValue({
+      source: 'passive',
+      five_hour: { utilization: 25, resets_at: null, remaining_seconds: 0 },
+      seven_day: {
+        utilization: 0, resets_at: null, remaining_seconds: 0,
+        quota_available: false, window_stats_period: 'last_7_days', window_stats: stats
+      },
+      seven_day_sonnet: { utilization: 30, resets_at: null, remaining_seconds: 0 },
+      seven_day_fable: { utilization: 40, resets_at: null, remaining_seconds: 0 }
+    })
+    const account = makeAccount({ id: type === 'oauth' ? 3201 : 3202, platform: 'anthropic', type, extra: {} })
+    const wrapper = mount(AccountUsageCell, {
+      props: { account },
+      global: { stubs: { AccountQuotaInfo: true, ClaudeResetCreditsCell: { template: '<div><slot name="pre-actions" /></div>' } } }
+    })
+    await flushPromises()
+    expect(getUsage).toHaveBeenCalledWith(account.id, 'passive', false)
+    const weekly = wrapper.findAllComponents(UsageProgressBar).find(bar => bar.props('label') === '7d')!
+    expect(weekly.props('windowStats')).toEqual(stats)
+    expect(weekly.props('windowStatsPeriod')).toBe('last_7_days')
+    expect(weekly.text()).toContain('12 req')
+    expect(weekly.text()).toContain('admin.accounts.usageWindow.quotaUnknown')
+    expect(weekly.text()).not.toContain('0%')
+    expect(wrapper.text()).toContain('25%')
+    expect(wrapper.text()).toContain('30%')
+    expect(wrapper.text()).toContain('40%')
+    getUsage.mockClear()
+    await wrapper.setProps({ manualRefreshToken: 1 })
+    await flushPromises()
+    expect(getUsage).toHaveBeenCalledWith(account.id, 'passive', true)
+    const manual = wrapper.findAll('button').find(button => button.text().includes('admin.accounts.usageWindow.activeQuery'))!
+    await manual.trigger('click')
+    await flushPromises()
+    expect(getUsage).toHaveBeenCalledWith(account.id, 'active', true)
+    wrapper.unmount()
+  })
+
+  it('Claude remount reads passive statistics again instead of the five-minute UI cache', async () => {
+    getUsage.mockResolvedValue({
+      source: 'passive',
+      seven_day: { utilization: 0, resets_at: null, remaining_seconds: 0, quota_available: false,
+        window_stats_period: 'last_7_days', window_stats: { requests: 1, tokens: 100, cost: 0 } }
+    })
+    const options = {
+      props: { account: makeAccount({ id: 3203, platform: 'anthropic', type: 'oauth', extra: {} }) },
+      global: { stubs: { AccountQuotaInfo: true, ClaudeResetCreditsCell: { template: '<div><slot name="pre-actions" /></div>' } } }
+    }
+    const first = mount(AccountUsageCell, options)
+    await flushPromises()
+    first.unmount()
+    const second = mount(AccountUsageCell, options)
+    await flushPromises()
+    expect(getUsage.mock.calls).toEqual([[3203, 'passive', false], [3203, 'passive', false]])
+    second.unmount()
+  })
+
+  it('desktop batch-managed Claude cells display weekly stats without individual requests', async () => {
+    const requestBatchedUsage = vi.fn()
+    const wrapper = mount(AccountUsageCell, {
+      props: {
+        account: makeAccount({ id: 3204, platform: 'anthropic', type: 'oauth', extra: {} }),
+        requestBatchedUsage,
+        batchedUsage: {
+          source: 'passive',
+          five_hour: null, seven_day_sonnet: null,
+          seven_day: { utilization: 0, resets_at: null, remaining_seconds: 0, quota_available: false,
+            window_stats_period: 'last_7_days', window_stats: { requests: 2, tokens: 100, cost: 0 } }
+        }
+      },
+      global: { stubs: { AccountQuotaInfo: true, ClaudeResetCreditsCell: { template: '<div><slot name="pre-actions" /></div>' } } }
+    })
+    await flushPromises()
+    expect(wrapper.text()).toContain('2 req')
+    expect(wrapper.text()).toContain('admin.accounts.usageWindow.quotaUnknown')
+    expect(getUsage).not.toHaveBeenCalled()
+    expect(requestBatchedUsage).toHaveBeenCalled()
+    wrapper.unmount()
+  })
+
 })

@@ -495,6 +495,10 @@ export default {
         }
       },
       usageWindow: {
+        quotaUnknown: '官方额度未知',
+        localStatsCycle: '当前周期：仅包含本站已记录用量',
+        localStatsLast7Days: '最近 7 天：仅包含本站已记录用量',
+
         statsTitle: '5小时窗口用量统计',
         statsTitleDaily: '每日用量统计',
         geminiProDaily: 'Pro',
