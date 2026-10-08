@@ -122,6 +122,11 @@ tests
 CLAUDE.md
 .claude
 scripts
+!.github/scripts/
+.github/scripts/*
+!.github/scripts/fork_promotion.py
+!.github/scripts/test_fork_promotion.py
+!.github/scripts/test_fork_transaction.py
 !backend/scripts/
 !backend/scripts/resolve-version.sh
 .code-review-state
