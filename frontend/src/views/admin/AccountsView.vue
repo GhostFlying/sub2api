@@ -836,7 +836,8 @@ const queueBatchedUsage = (account: Account, options?: { force?: boolean }) => {
 
   if (force) {
     usageBatchCache.delete(cacheKey)
-  } else {
+  } else if (!(account.platform === 'anthropic' && (account.type === 'oauth' || account.type === 'setup-token'))) {
+    // Claude local statistics rely on the backend one-minute cache.
     const cached = usageBatchCache.get(cacheKey)
     if (cached && Date.now() - cached.ts < USAGE_BATCH_CACHE_TTL) {
       setUsageBatchState(cacheKey, cached.data, null)

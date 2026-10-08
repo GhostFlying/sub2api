@@ -50,12 +50,15 @@
           color="indigo"
         />
 
-        <!-- 7d Window (OAuth only) -->
+        <!-- 7d local usage and optional official quota (OAuth / Setup Token) -->
         <UsageProgressBar
           v-if="usageInfo.seven_day"
           label="7d"
           :utilization="usageInfo.seven_day.utilization"
           :resets-at="usageInfo.seven_day.resets_at"
+          :window-stats="usageInfo.seven_day.window_stats"
+          :window-stats-period="usageInfo.seven_day.window_stats_period"
+          :quota-available="usageInfo.seven_day.quota_available"
           color="emerald"
         />
 
@@ -1418,8 +1421,9 @@ const loadUsage = async (options?: { source?: 'passive' | 'active'; bypassCache?
     return
   }
 
-  // Check cache
-  if (!options?.bypassCache) {
+  // Claude local statistics use the backend 1-minute cache; do not retain them
+  // in the shared 5-minute UI cache when the cell is loaded again.
+  if (!options?.bypassCache && !isAnthropicOAuthOrSetupToken.value) {
     const cached = _usageCache.get(props.account.id)
     if (cached && Date.now() - cached.ts < USAGE_CACHE_TTL) {
       usageInfo.value = cached.data

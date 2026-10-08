@@ -96,6 +96,13 @@ type apiUsageCache struct {
 type windowStatsCache struct {
 	stats     *WindowStats
 	timestamp time.Time
+	period    string
+	startTime time.Time
+}
+
+type windowStatsCacheKey struct {
+	accountID int64
+	window    string
 }
 
 // antigravityUsageCache 缓存 Antigravity 额度数据
@@ -118,7 +125,7 @@ const (
 // UsageCache 封装账户使用量相关的缓存
 type UsageCache struct {
 	apiCache          sync.Map           // accountID -> *apiUsageCache
-	windowStatsCache  sync.Map           // accountID -> *windowStatsCache
+	windowStatsCache  sync.Map           // windowStatsCacheKey -> *windowStatsCache
 	antigravityCache  sync.Map           // accountID -> *antigravityUsageCache
 	apiFlight         singleflight.Group // 防止同一账号的并发请求击穿缓存（Anthropic）
 	antigravityFlight singleflight.Group // 防止同一 Antigravity 账号的并发请求击穿缓存
@@ -146,12 +153,14 @@ type WindowStats struct {
 
 // UsageProgress 使用量进度
 type UsageProgress struct {
-	Utilization      float64      `json:"utilization"`            // 使用率百分比 (0-100+，100表示100%)
-	ResetsAt         *time.Time   `json:"resets_at"`              // 重置时间
-	RemainingSeconds int          `json:"remaining_seconds"`      // 距重置剩余秒数
-	WindowStats      *WindowStats `json:"window_stats,omitempty"` // 窗口期统计（从窗口开始到当前的使用量）
-	UsedRequests     int64        `json:"used_requests,omitempty"`
-	LimitRequests    int64        `json:"limit_requests,omitempty"`
+	Utilization       float64      `json:"utilization"`       // 使用率百分比 (0-100+，100表示100%)
+	ResetsAt          *time.Time   `json:"resets_at"`         // 重置时间
+	RemainingSeconds  int          `json:"remaining_seconds"` // 距重置剩余秒数
+	WindowStatsPeriod string       `json:"window_stats_period,omitempty"`
+	QuotaAvailable    *bool        `json:"quota_available,omitempty"`
+	WindowStats       *WindowStats `json:"window_stats,omitempty"` // 窗口期统计（从窗口开始到当前的使用量）
+	UsedRequests      int64        `json:"used_requests,omitempty"`
+	LimitRequests     int64        `json:"limit_requests,omitempty"`
 }
 
 // AntigravityModelQuota Antigravity 单个模型的配额信息
@@ -259,8 +268,8 @@ type ClaudeUsageResponse struct {
 		ResetsAt    string  `json:"resets_at"`
 	} `json:"five_hour"`
 	SevenDay struct {
-		Utilization float64 `json:"utilization"`
-		ResetsAt    string  `json:"resets_at"`
+		Utilization *float64 `json:"utilization"`
+		ResetsAt    string   `json:"resets_at"`
 	} `json:"seven_day"`
 	SevenDaySonnet struct {
 		Utilization float64 `json:"utilization"`
@@ -613,7 +622,7 @@ func (s *AccountUsageService) getPassiveUsageForAccount(ctx context.Context, acc
 	}
 
 	// 构建 7d 窗口（从被动采样数据）
-	info.SevenDay = buildPassiveUsageWindow(account.Extra, "passive_usage_7d_utilization", "passive_usage_7d_reset")
+	info.SevenDay = buildClaudePassiveSevenDay(account.Extra)
 
 	// 构建 7d Fable 窗口（从被动采样的 7d_oi 响应头数据）
 	info.SevenDayFable = buildPassiveUsageWindow(account.Extra, "passive_usage_7d_oi_utilization", "passive_usage_7d_oi_reset")
@@ -642,6 +651,18 @@ func applySyntheticWindowStats(info *UsageInfo, extra map[string]any) {
 		StandardCost: parseExtraFloat64(raw["standard_cost"]),
 		UserCost:     parseExtraFloat64(raw["user_cost"]),
 	}
+}
+
+// buildClaudePassiveSevenDay keeps local usage visible even before quota sampling.
+func buildClaudePassiveSevenDay(extra map[string]any) *UsageProgress {
+	progress := buildPassiveUsageWindow(extra, "passive_usage_7d_utilization", "passive_usage_7d_reset")
+	if progress == nil {
+		progress = &UsageProgress{}
+	}
+	raw, exists := extra["passive_usage_7d_utilization"]
+	available := exists && raw != nil
+	progress.QuotaAvailable = &available
+	return progress
 }
 
 // buildPassiveUsageWindow 从 Extra 中的被动采样数据（utilization 为 0-1 小数、reset 为 Unix 秒）
@@ -677,7 +698,7 @@ func (s *AccountUsageService) syncActiveToPassive(ctx context.Context, accountID
 	if usage.FiveHour != nil {
 		extraUpdates["session_window_utilization"] = usage.FiveHour.Utilization / 100
 	}
-	if usage.SevenDay != nil {
+	if usage.SevenDay != nil && (usage.SevenDay.QuotaAvailable == nil || *usage.SevenDay.QuotaAvailable) {
 		extraUpdates["passive_usage_7d_utilization"] = usage.SevenDay.Utilization / 100
 		if usage.SevenDay.ResetsAt != nil {
 			extraUpdates["passive_usage_7d_reset"] = usage.SevenDay.ResetsAt.Unix()
@@ -1341,53 +1362,63 @@ func enrichUsageWithAccountError(info *UsageInfo, account *Account) {
 	info.NeedsReauth = false
 }
 
-// addWindowStats 为 usage 数据添加窗口期统计
-// 使用独立缓存（1 分钟），与 API 缓存分离
+// addWindowStats attaches local log statistics without making upstream requests.
 func (s *AccountUsageService) addWindowStats(ctx context.Context, account *Account, usage *UsageInfo) {
-	// 修复：即使 FiveHour 为 nil，也要尝试获取统计数据
-	// 因为 SevenDay/SevenDaySonnet/SevenDayFable 可能需要
-	if usage.FiveHour == nil && usage.SevenDay == nil && usage.SevenDaySonnet == nil && usage.SevenDayFable == nil {
-		return
+	s.addWindowStatsAt(ctx, account, usage, time.Now())
+}
+
+func (s *AccountUsageService) addWindowStatsAt(ctx context.Context, account *Account, usage *UsageInfo, now time.Time) {
+	if usage.FiveHour != nil && s.usageLogRepo != nil {
+		usage.FiveHour.WindowStats = s.cachedWindowStats(ctx, account.ID, "5h", "cycle", account.GetCurrentWindowStartTime(), now)
 	}
 
-	// 检查窗口统计缓存（1 分钟）
-	var windowStats *WindowStats
-	if cached, ok := s.cache.windowStatsCache.Load(account.ID); ok {
-		if cache, ok := cached.(*windowStatsCache); ok && time.Since(cache.timestamp) < windowStatsCacheTTL {
-			windowStats = cache.stats
+	if usage.SevenDay == nil {
+		usage.SevenDay = buildClaudePassiveSevenDay(account.Extra)
+	}
+	weekly := usage.SevenDay
+	startTime, period := claudeSevenDayStatsStart(weekly, now)
+	weekly.WindowStatsPeriod = period
+	available := weekly.QuotaAvailable != nil && *weekly.QuotaAvailable
+	if weekly.ResetsAt != nil && period != "cycle" {
+		available = false
+	}
+	weekly.QuotaAvailable = &available
+	if s.usageLogRepo != nil {
+		weekly.WindowStats = s.cachedWindowStats(ctx, account.ID, "7d", period, startTime, now)
+	}
+}
+
+// claudeSevenDayStatsStart distinguishes a known cycle from a rolling local view.
+func claudeSevenDayStatsStart(progress *UsageProgress, now time.Time) (time.Time, string) {
+	window := 7 * 24 * time.Hour
+	if progress != nil && progress.ResetsAt != nil && now.Before(*progress.ResetsAt) && !progress.ResetsAt.After(now.Add(window)) {
+		return progress.ResetsAt.Add(-window), "cycle"
+	}
+	return now.Add(-window), "last_7_days"
+}
+
+func (s *AccountUsageService) cachedWindowStats(ctx context.Context, accountID int64, window, period string, startTime, now time.Time) *WindowStats {
+	key := windowStatsCacheKey{accountID: accountID, window: window}
+	if s.cache != nil {
+		if cached, ok := s.cache.windowStatsCache.Load(key); ok {
+			if entry, ok := cached.(*windowStatsCache); ok && now.Sub(entry.timestamp) < windowStatsCacheTTL && entry.period == period &&
+				(period == "last_7_days" || entry.startTime.Equal(startTime)) {
+				return entry.stats
+			}
 		}
 	}
-
-	// 如果没有缓存，从数据库查询
-	if windowStats == nil {
-		// 使用统一的窗口开始时间计算逻辑（考虑窗口过期情况）
-		startTime := account.GetCurrentWindowStartTime()
-
-		stats, err := s.usageLogRepo.GetAccountWindowStats(ctx, account.ID, startTime)
-		if err != nil {
-			log.Printf("Failed to get window stats for account %d: %v", account.ID, err)
-			return
-		}
-
-		windowStats = &WindowStats{
-			Requests:     stats.Requests,
-			Tokens:       stats.Tokens,
-			Cost:         stats.Cost,
-			StandardCost: stats.StandardCost,
-			UserCost:     stats.UserCost,
-		}
-
-		// 缓存窗口统计（1 分钟）
-		s.cache.windowStatsCache.Store(account.ID, &windowStatsCache{
-			stats:     windowStats,
-			timestamp: time.Now(),
+	stats, err := s.usageLogRepo.GetAccountWindowStats(ctx, accountID, startTime)
+	if err != nil {
+		log.Printf("Failed to get %s window stats for account %d: %v", window, accountID, err)
+		return nil
+	}
+	result := windowStatsFromAccountStats(stats)
+	if s.cache != nil {
+		s.cache.windowStatsCache.Store(key, &windowStatsCache{
+			stats: result, timestamp: now, period: period, startTime: startTime,
 		})
 	}
-
-	// 为 FiveHour 添加 WindowStats（5h 窗口统计）
-	if usage.FiveHour != nil {
-		usage.FiveHour.WindowStats = windowStats
-	}
+	return result
 }
 
 // GetTodayStats 获取账号今日统计
@@ -1650,19 +1681,18 @@ func (s *AccountUsageService) buildUsageInfo(resp *ClaudeUsageResponse, updatedA
 		}
 	}
 
-	// 7天窗口
+	// A pointer preserves the distinction between a reported 0% and missing usage.
+	quotaAvailable := resp.SevenDay.Utilization != nil
+	info.SevenDay = &UsageProgress{QuotaAvailable: &quotaAvailable}
+	if quotaAvailable {
+		info.SevenDay.Utilization = *resp.SevenDay.Utilization
+	}
 	if resp.SevenDay.ResetsAt != "" {
-		if sevenDayReset, err := parseTime(resp.SevenDay.ResetsAt); err == nil {
-			info.SevenDay = &UsageProgress{
-				Utilization:      resp.SevenDay.Utilization,
-				ResetsAt:         &sevenDayReset,
-				RemainingSeconds: int(time.Until(sevenDayReset).Seconds()),
-			}
+		if resetAt, err := parseTime(resp.SevenDay.ResetsAt); err == nil {
+			info.SevenDay.ResetsAt = &resetAt
+			info.SevenDay.RemainingSeconds = max(0, int(time.Until(resetAt).Seconds()))
 		} else {
 			log.Printf("Failed to parse SevenDay.ResetsAt: %s, error: %v", resp.SevenDay.ResetsAt, err)
-			info.SevenDay = &UsageProgress{
-				Utilization: resp.SevenDay.Utilization,
-			}
 		}
 	}
 
