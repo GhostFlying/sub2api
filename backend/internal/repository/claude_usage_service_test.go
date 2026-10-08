@@ -53,7 +53,7 @@ func (s *ClaudeUsageServiceSuite) TestFetchUsage_Success() {
 	resp, err := s.fetcher.FetchUsage(context.Background(), "at", "")
 	require.NoError(s.T(), err, "FetchUsage")
 	require.Equal(s.T(), 12.5, resp.FiveHour.Utilization, "FiveHour utilization mismatch")
-	require.Equal(s.T(), 34.0, resp.SevenDay.Utilization, "SevenDay utilization mismatch")
+	require.Equal(s.T(), 34.0, *resp.SevenDay.Utilization, "SevenDay utilization mismatch")
 	require.Equal(s.T(), 56.0, resp.SevenDaySonnet.Utilization, "SevenDaySonnet utilization mismatch")
 
 	// Assertions on captured request data

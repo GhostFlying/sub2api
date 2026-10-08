@@ -1625,6 +1625,10 @@ export default {
         noData: 'No usage data available for this account'
       },
       usageWindow: {
+        quotaUnknown: 'Official quota unknown',
+        localStatsCycle: 'Current cycle: only usage recorded on this site',
+        localStatsLast7Days: 'Last 7 days: only usage recorded on this site',
+
         statsTitle: '5-Hour Window Usage Statistics',
         statsTitleDaily: 'Daily Usage Statistics',
         geminiProDaily: 'Pro',
