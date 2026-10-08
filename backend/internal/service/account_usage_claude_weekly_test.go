@@ -238,7 +238,55 @@ func TestClaudeUnknownWeeklyDoesNotPersistFakeQuota(t *testing.T) {
 	svc := &AccountUsageService{accountRepo: repo}
 	available := false
 	svc.syncActiveToPassive(t.Context(), 42, &UsageInfo{SevenDay: &UsageProgress{QuotaAvailable: &available}})
-	require.Empty(t, repo.extraUpdates)
+	require.Len(t, repo.extraUpdates, 1)
+	require.Contains(t, repo.extraUpdates[0], "passive_usage_7d_utilization")
+	require.Nil(t, repo.extraUpdates[0]["passive_usage_7d_utilization"])
+	require.Nil(t, repo.extraUpdates[0]["passive_usage_7d_reset"])
+}
+
+func TestClaudeActiveWeeklyReplacesOldPassiveSample(t *testing.T) {
+	now := time.Date(2030, 1, 10, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name, payload    string
+		available, cycle bool
+	}{
+		{"absent weekly", `{}`, false, false},
+		{"unknown utilization with cycle", `{"seven_day":{"resets_at":"2030-01-12T12:00:00Z"}}`, false, true},
+		{"new quota without reset", `{"seven_day":{"utilization":40}}`, true, false},
+		{"expired quota", `{"seven_day":{"utilization":40,"resets_at":"2030-01-09T12:00:00Z"}}`, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var response ClaudeUsageResponse
+			require.NoError(t, json.Unmarshal([]byte(tc.payload), &response))
+			repo := &sessionWindowSyncRepo{}
+			svc := &AccountUsageService{accountRepo: repo, usageLogRepo: &claudeWeeklyLogRepo{}}
+			usage := svc.buildUsageInfo(&response, &now)
+			svc.addWindowStatsAt(t.Context(), &Account{ID: 42}, usage, now)
+			svc.syncActiveToPassive(t.Context(), 42, usage)
+			require.Len(t, repo.extraUpdates, 1)
+			// Simulate the repository's JSONB merge into an existing sample.
+			extra := map[string]any{"passive_usage_7d_utilization": 0.9, "passive_usage_7d_reset": now.Add(time.Hour).Unix()}
+			for key, value := range repo.extraUpdates[0] {
+				extra[key] = value
+			}
+			passive := &UsageInfo{SevenDay: buildClaudePassiveSevenDay(extra)}
+			svc.addWindowStatsAt(t.Context(), &Account{ID: 42}, passive, now)
+			require.Equal(t, tc.available, *passive.SevenDay.QuotaAvailable)
+			require.NotNil(t, passive.SevenDay.WindowStats)
+			if tc.cycle {
+				require.Equal(t, "cycle", passive.SevenDay.WindowStatsPeriod)
+				require.Equal(t, now.Add(48*time.Hour).Unix(), extra["passive_usage_7d_reset"])
+			} else {
+				require.Nil(t, passive.SevenDay.ResetsAt)
+				require.Equal(t, "last_7_days", passive.SevenDay.WindowStatsPeriod)
+			}
+			if tc.available {
+				require.Equal(t, 40.0, passive.SevenDay.Utilization)
+			} else {
+				require.Nil(t, extra["passive_usage_7d_utilization"])
+			}
+		})
+	}
 }
 
 func TestClaudeWeeklyBatchRemainsPassive(t *testing.T) {

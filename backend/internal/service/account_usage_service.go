@@ -698,9 +698,16 @@ func (s *AccountUsageService) syncActiveToPassive(ctx context.Context, accountID
 	if usage.FiveHour != nil {
 		extraUpdates["session_window_utilization"] = usage.FiveHour.Utilization / 100
 	}
-	if usage.SevenDay != nil && (usage.SevenDay.QuotaAvailable == nil || *usage.SevenDay.QuotaAvailable) {
-		extraUpdates["passive_usage_7d_utilization"] = usage.SevenDay.Utilization / 100
-		if usage.SevenDay.ResetsAt != nil {
+	if usage.SevenDay != nil {
+		available := usage.SevenDay.QuotaAvailable == nil || *usage.SevenDay.QuotaAvailable
+		// Replace missing official values instead of retaining an older sample.
+		extraUpdates["passive_usage_7d_utilization"] = nil
+		extraUpdates["passive_usage_7d_reset"] = nil
+		if available {
+			extraUpdates["passive_usage_7d_utilization"] = usage.SevenDay.Utilization / 100
+		}
+		// A valid cycle boundary still helps local statistics without utilization.
+		if usage.SevenDay.ResetsAt != nil && (available || usage.SevenDay.WindowStatsPeriod == "cycle") {
 			extraUpdates["passive_usage_7d_reset"] = usage.SevenDay.ResetsAt.Unix()
 		}
 	}
