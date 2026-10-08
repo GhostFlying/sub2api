@@ -134,6 +134,9 @@ deploy/docker-compose.override.yml
 vite.config.js
 docs/*
 !docs/admin-api-keys.md
+!docs/plans/
+docs/plans/*
+!docs/plans/claude-7d-local-usage.md
 !docs/PAYMENT.md
 !docs/PAYMENT_CN.md
 !docs/ADMIN_PAYMENT_INTEGRATION_API.md
