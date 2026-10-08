@@ -28,33 +28,9 @@ env:
 
 jobs:
   sync:
+    if: github.repository == 'GhostFlying/sub2api'
     runs-on: ubuntu-latest
     steps:
-      - name: Resolve upstream release
-        id: release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          INPUT_TAG: ${{ inputs.upstream_tag }}
-        run: |
-          set -euo pipefail
-
-          if [ -n "${INPUT_TAG}" ]; then
-            TAG="${INPUT_TAG}"
-          else
-            TAG="$(gh release view --repo "${UPSTREAM_REPOSITORY}" --json tagName --jq .tagName)"
-          fi
-
-          if [ -z "${TAG}" ]; then
-            echo "No upstream release tag found"
-            exit 1
-          fi
-
-          SAFE_TAG="$(printf '%s' "${TAG}" | sed 's/[^A-Za-z0-9._-]/-/g')"
-          BRANCH="sync/upstream-${SAFE_TAG}"
-
-          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
-          echo "branch=${BRANCH}" >> "${GITHUB_OUTPUT}"
-
       - name: Checkout fork branch
         uses: actions/checkout@v6
         with:
@@ -62,10 +38,24 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.FORK_MAINTENANCE_TOKEN }}
 
+      - name: Resolve published stable upstream release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${UPSTREAM_REPOSITORY}/releases?per_page=100" \
+            --paginate --jq '.[]' > /tmp/upstream-releases.jsonl
+          TAG="$(python .github/scripts/fork_promotion.py select-release \
+            --releases /tmp/upstream-releases.jsonl --requested "${INPUT_TAG}")"
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+          echo "branch=sync/upstream-${TAG}" >> "${GITHUB_OUTPUT}"
+
       - name: Configure git
         run: |
-          git config user.name "$(git log -1 --format=%cn HEAD)"
-          git config user.email "$(git log -1 --format=%ce HEAD)"
+          git config user.name "$(git log -1 --format=%an HEAD)"
+          git config user.email "$(git log -1 --format=%ae HEAD)"
 
       - name: Fetch upstream and fork refs
         run: |
@@ -94,6 +84,9 @@ jobs:
           BASE_SHA="$(git rev-parse "origin/${BASE_BRANCH}^{commit}")"
 
           while IFS= read -r CANDIDATE; do
+            if ! git merge-base --is-ancestor "${TAG_SHA}" "${CANDIDATE}"; then
+              continue
+            fi
             SUBJECT="$(git log -1 --format=%s "${CANDIDATE}")"
             if [ "${SUBJECT}" != "chore: sync VERSION to ${VERSION} [skip ci]" ]; then
               continue
@@ -141,6 +134,7 @@ jobs:
           BASE_SHA: ${{ steps.state.outputs.base_sha }}
           ANCHOR_SHA: ${{ steps.state.outputs.anchor_sha }}
           EFFECTIVE_BASE_SHA: ${{ steps.state.outputs.effective_base_sha }}
+          TAG_SHA: ${{ steps.state.outputs.tag_sha }}
         run: |
           set -euo pipefail
 
@@ -182,8 +176,10 @@ jobs:
               --arg anchor_sha "${ANCHOR_SHA}" \
               --arg effective_base_sha "${EFFECTIVE_BASE_SHA}" \
               --arg head_sha "${PREVIEW_SHA}" \
+              --arg tag_sha "${TAG_SHA}" \
               '
-                .version == 1 and
+                .version == 2 and
+                .tag_sha == $tag_sha and
                 .tag == $tag and
                 .base_sha == $base_sha and
                 .anchor_sha == $anchor_sha and
@@ -357,7 +353,7 @@ jobs:
             echo "1. Create a local branch from \`${EFFECTIVE_BASE_SHA}\`."
             echo "2. Cherry-pick \`${ANCHOR_BRANCH}..${BASE_BRANCH}\` in order."
             echo "3. Resolve conflicts and push a replacement \`sync/upstream-${TAG}\` preview branch."
-            echo "4. Keep \`${BASE_BRANCH}\` unchanged until a reviewed \`/promote-fork\` succeeds."
+            echo "4. Keep \`${BASE_BRANCH}\` unchanged; passing candidate checks automatically trigger leased promotion."
           } > "${BODY_FILE}"
 
           ISSUE_JSON="$(gh issue list \
@@ -433,6 +429,7 @@ jobs:
             "${BRANCH}:refs/heads/${BRANCH}"
 
       - name: Create or update preview pull request
+        id: pull_request
         if: ${{ steps.replay.outputs.result == 'success' }}
         env:
           GH_TOKEN: ${{ secrets.FORK_MAINTENANCE_TOKEN }}
@@ -455,8 +452,10 @@ jobs:
             --arg anchor_sha "${ANCHOR_SHA}" \
             --arg effective_base_sha "${EFFECTIVE_BASE_SHA}" \
             --arg head_sha "${HEAD_SHA}" \
+            --arg tag_sha "${TAG_SHA}" \
             '{
-              version: 1,
+              version: 2,
+              tag_sha: $tag_sha,
               tag: $tag,
               base_sha: $base_sha,
               anchor_sha: $anchor_sha,
@@ -481,7 +480,7 @@ jobs:
             echo
             echo "**Do not use the GitHub merge button.**"
             echo
-            echo "After reviewing the diff and checks, comment \`/promote-fork\`. The promote workflow will force-with-lease rewrite \`${BASE_BRANCH}\`, move \`${ANCHOR_BRANCH}\` to the effective upstream baseline, close this PR, and delete \`${BRANCH}\`."
+            echo "Passing CI and security checks automatically trigger promotion. The finalizer revalidates the exact candidate and source refs, atomically rewrites \`${BASE_BRANCH}\` and \`${ANCHOR_BRANCH}\`, closes this audit PR, and deletes \`${BRANCH}\`. No manual prompt or merge is needed."
             echo
             echo "<!-- fork-sync-source ${MARKER_JSON} -->"
           } > "${BODY_FILE}"
@@ -508,22 +507,40 @@ jobs:
               --draft \
               --title "chore: preview upstream ${TAG} on fork" \
               --body-file "${BODY_FILE}"
+            PR_NUMBER="$(gh pr list --repo "${GITHUB_REPOSITORY}" \
+              --base "${BASE_BRANCH}" --head "${BRANCH}" --state open \
+              --json number --jq '.[0].number')"
           fi
+          echo "pr_number=${PR_NUMBER}" >> "${GITHUB_OUTPUT}"
 
-      - name: Dispatch preview checks
-        if: ${{ steps.replay.outputs.result == 'success' }}
+      - name: Ensure candidate checks are scheduled
+        if: ${{ steps.replay.outputs.result == 'success' || steps.preview.outputs.active == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.FORK_MAINTENANCE_TOKEN }}
           BRANCH: ${{ steps.release.outputs.branch }}
+          HEAD_SHA: ${{ steps.replay.outputs.head_sha || steps.preview.outputs.head_sha }}
+          NEW_CANDIDATE: ${{ steps.replay.outputs.result == 'success' }}
         run: |
           set -euo pipefail
+          for WORKFLOW in backend-ci.yml security-scan.yml; do
+            RUN_COUNT="$(gh api \
+              "repos/${GITHUB_REPOSITORY}/actions/workflows/${WORKFLOW}/runs?head_sha=${HEAD_SHA}&per_page=100" \
+              --jq '[.workflow_runs[] | select(.event == "push" or .event == "workflow_dispatch")] | length')"
+            if [ "${NEW_CANDIDATE}" = "true" ] || [ "${RUN_COUNT}" = "0" ]; then
+              gh workflow run "${WORKFLOW}" --repo "${GITHUB_REPOSITORY}" --ref "${BRANCH}"
+            fi
+          done
 
-          gh workflow run "CI" \
-            --repo "${GITHUB_REPOSITORY}" \
-            --ref "${BRANCH}"
-          gh workflow run "Security Scan" \
-            --repo "${GITHUB_REPOSITORY}" \
-            --ref "${BRANCH}"
+      - name: Queue automatic promotion
+        if: ${{ steps.replay.outputs.result == 'success' || steps.preview.outputs.active == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.FORK_MAINTENANCE_TOKEN }}
+          PR_NUMBER: ${{ steps.pull_request.outputs.pr_number || steps.preview.outputs.pr_number }}
+          HEAD_SHA: ${{ steps.replay.outputs.head_sha || steps.preview.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          gh workflow run promote-fork.yml --repo "${GITHUB_REPOSITORY}" \
+            --ref "${BASE_BRANCH}" -f "pr_number=${PR_NUMBER}" -f "expected_head=${HEAD_SHA}"
 
       - name: Close resolved or stale conflict issue
         if: ${{ steps.state.outputs.already_current == 'true' || steps.preview.outputs.active == 'true' || steps.replay.outputs.result == 'success' }}
