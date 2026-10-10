@@ -47,6 +47,10 @@
           :utilization="usageInfo.five_hour.utilization"
           :resets-at="usageInfo.five_hour.resets_at"
           :window-stats="usageInfo.five_hour.window_stats"
+          show-details
+          @details="openModelDetails('5h')"
+          :window-stats-period="usageInfo.five_hour.window_stats_period"
+          :quota-available="usageInfo.five_hour.quota_available"
           color="indigo"
         />
 
@@ -57,6 +61,8 @@
           :utilization="usageInfo.seven_day.utilization"
           :resets-at="usageInfo.seven_day.resets_at"
           :window-stats="usageInfo.seven_day.window_stats"
+          show-details
+          @details="openModelDetails('7d')"
           :window-stats-period="usageInfo.seven_day.window_stats_period"
           :quota-available="usageInfo.seven_day.quota_available"
           color="emerald"
@@ -134,6 +140,10 @@
           :utilization="usageInfo.five_hour.utilization"
           :resets-at="usageInfo.five_hour.resets_at"
           :window-stats="usageInfo.five_hour.window_stats"
+          show-details
+          @details="openModelDetails('5h')"
+          :window-stats-period="usageInfo.five_hour.window_stats_period"
+          :quota-available="usageInfo.five_hour.quota_available"
           :show-now-when-idle="true"
           color="indigo"
         />
@@ -143,6 +153,10 @@
           :utilization="usageInfo.seven_day.utilization"
           :resets-at="usageInfo.seven_day.resets_at"
           :window-stats="usageInfo.seven_day.window_stats"
+          show-details
+          @details="openModelDetails('7d')"
+          :window-stats-period="usageInfo.seven_day.window_stats_period"
+          :quota-available="usageInfo.seven_day.quota_available"
           :estimated-total-cost="openAISevenDayEstimatedTotalCost"
           :show-now-when-idle="true"
           color="emerald"
@@ -592,6 +606,12 @@
     <template v-else>
       <div class="text-xs text-gray-400">-</div>
     </template>
+    <div v-if="supportsModelDetails && (!usageInfo?.five_hour || !usageInfo?.seven_day)" class="mt-1 flex flex-wrap gap-2">
+      <button v-for="window in missingModelWindows" :key="window" type="button" class="rounded text-xs text-primary-600 hover:underline focus-visible:ring-2 focus-visible:ring-primary-500 dark:text-primary-400" @click="openModelDetails(window)">
+        {{ window }} {{ t('admin.accounts.usageWindow.modelDetails') }}
+      </button>
+    </div>
+    <AccountModelUsageDialog v-if="supportsModelDetails" :show="modelDetailsOpen" :account-id="account.id" :account-name="account.name ?? String(account.id)" :initial-window="modelDetailsWindow" @close="modelDetailsOpen = false" @loaded="applyModelDetails" />
   </div>
 
   <!-- Non-OAuth/Setup-Token accounts -->
@@ -681,11 +701,12 @@
 import { ref, computed, onMounted, onBeforeUnmount, onUnmounted, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { adminAPI } from '@/api/admin'
-import type { Account, AccountUsageInfo, GeminiCredentials, WindowStats } from '@/types'
+import type { Account, AccountUsageInfo, GeminiCredentials, WindowStats, UsageWindow, AccountModelWindowStats } from '@/types'
 import { buildOpenAIUsageRefreshKey } from '@/utils/accountUsageRefresh'
 import { enqueueUsageRequest } from '@/utils/usageLoadQueue'
 import { formatCompactNumber } from '@/utils/format'
 import UsageProgressBar from './UsageProgressBar.vue'
+import AccountModelUsageDialog from './AccountModelUsageDialog.vue'
 import AccountQuotaInfo from './AccountQuotaInfo.vue'
 import ClaudeResetCreditsCell from './ClaudeResetCreditsCell.vue'
 import OpenAIQuotaResetCell from './OpenAIQuotaResetCell.vue'
@@ -732,6 +753,27 @@ const emit = defineEmits<{
 }>()
 
 const { t } = useI18n()
+const modelDetailsOpen = ref(false)
+const modelDetailsWindow = ref<UsageWindow>('5h')
+const supportsModelDetails = computed(() =>
+  (props.account.platform === 'anthropic' && ['oauth', 'setup-token'].includes(props.account.type)) ||
+  (props.account.platform === 'openai' && props.account.type === 'oauth')
+)
+const missingModelWindows = computed(() => (['5h', '7d'] as const).filter(window =>
+  !(window === '5h' ? usageInfo.value?.five_hour : usageInfo.value?.seven_day)
+))
+const openModelDetails = (window: UsageWindow) => {
+  modelDetailsWindow.value = window
+  modelDetailsOpen.value = true
+}
+const applyModelDetails = (snapshot: AccountModelWindowStats) => {
+  const usage: AccountUsageInfo = usageInfo.value ?? { updated_at: null, five_hour: null, seven_day: null, seven_day_sonnet: null }
+  const key = snapshot.window === '5h' ? 'five_hour' : 'seven_day'
+  const progress = usage[key] ?? { utilization: 0, resets_at: null, remaining_seconds: 0, quota_available: false }
+  usageInfo.value = { ...usage, [key]: { ...progress, window_stats: snapshot.totals, window_stats_period: snapshot.period } }
+}
+watch(() => props.account.id, () => { modelDetailsOpen.value = false })
+
 const desktopViewportQuery = '(min-width: 768px)'
 
 const unmounted = ref(false)

@@ -4,8 +4,9 @@ import AccountUsageCell from '../AccountUsageCell.vue'
 import UsageProgressBar from '../UsageProgressBar.vue'
 import type { Account } from '@/types'
 
-const { getUsage, listBackgroundTasks } = vi.hoisted(() => ({
+const { getUsage, getUsageModelStats, listBackgroundTasks } = vi.hoisted(() => ({
   getUsage: vi.fn(),
+  getUsageModelStats: vi.fn(),
   listBackgroundTasks: vi.fn()
 }))
 
@@ -21,7 +22,8 @@ vi.mock('@/api/admin/backgroundTasks', () => ({
 vi.mock('@/api/admin', () => ({
   adminAPI: {
     accounts: {
-      getUsage
+      getUsage,
+      getUsageModelStats
     }
   }
 }))
@@ -31,7 +33,8 @@ vi.mock('vue-i18n', async () => {
   return {
     ...actual,
     useI18n: () => ({
-      t: (key: string) => key
+      t: (key: string) => key,
+      locale: { value: 'en' }
     })
   }
 })
@@ -1897,6 +1900,48 @@ describe('AccountUsageCell', () => {
     expect(wrapper.text()).toContain('admin.accounts.usageWindow.quotaUnknown')
     expect(getUsage).not.toHaveBeenCalled()
     expect(requestBatchedUsage).toHaveBeenCalled()
+    wrapper.unmount()
+  })
+
+})
+
+
+describe('account model details entries', () => {
+  it.each([
+    { platform: 'anthropic', type: 'oauth' },
+    { platform: 'anthropic', type: 'setup-token' },
+    { platform: 'openai', type: 'oauth' }
+  ] as const)('offers local windows without quota and performs no initial detail query for $platform/$type', async (accountType) => {
+    getUsageModelStats.mockClear()
+    const wrapper = mount(AccountUsageCell, {
+      props: { account: makeAccount(accountType), requestBatchedUsage: vi.fn() },
+      global: { stubs: { AccountModelUsageDialog: { props: ['show', 'initialWindow'], template: '<div data-test="details" :data-show="show" :data-window="initialWindow" />' } } }
+    })
+    await flushPromises()
+    expect(getUsageModelStats).not.toHaveBeenCalled()
+    const buttons = wrapper.findAll('button').filter(b => b.text().includes('usageWindow.modelDetails'))
+    expect(buttons, wrapper.html()).toHaveLength(2)
+    await buttons[1].trigger('click')
+    expect(wrapper.get('[data-test="details"]').attributes('data-window')).toBe('7d')
+    expect(wrapper.get('[data-test="details"]').attributes('data-show')).toBe('true')
+    wrapper.unmount()
+  })
+  it('updates window totals while preserving official quota state', async () => {
+    const progress = { utilization: 35, resets_at: '2026-10-10T10:00:00Z', remaining_seconds: 1234, quota_available: true }
+    const wrapper = mount(AccountUsageCell, {
+      props: { account: makeAccount({ platform: 'openai', type: 'oauth' }), requestBatchedUsage: vi.fn(), batchedUsage: { updated_at: null, five_hour: progress, seven_day: progress, seven_day_sonnet: null } },
+      global: { stubs: { AccountModelUsageDialog: { name: 'AccountModelUsageDialog', template: '<div />' } } }
+    })
+    const totals = { requests: 2, tokens: 100, cost: 2, standard_cost: 1, user_cost: 0.5, input_tokens: 10, cache_read_tokens: 20, cache_creation_tokens: 30, output_tokens: 40, total_tokens: 100 }
+    wrapper.findComponent({ name: 'AccountModelUsageDialog' }).vm.$emit('loaded', { window: '5h', period: 'last_5_hours', totals })
+    await flushPromises()
+    const usage = wrapper.emitted('usage-loaded')!.at(-1)![0] as { five_hour: typeof progress & { window_stats: typeof totals; window_stats_period: string }; seven_day: typeof progress }
+    expect(usage.five_hour.window_stats).toEqual(totals)
+    expect(usage.five_hour.window_stats_period).toBe('last_5_hours')
+    expect(usage.five_hour.utilization).toBe(35)
+    expect(usage.five_hour.resets_at).toBe(progress.resets_at)
+    expect(usage.five_hour.quota_available).toBe(true)
+    expect(usage.seven_day).toEqual(progress)
     wrapper.unmount()
   })
 
