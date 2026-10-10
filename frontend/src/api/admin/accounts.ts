@@ -12,6 +12,8 @@ import type {
   UpdateAccountRequest,
   PaginatedResponse,
   AccountUsageInfo,
+  AccountModelWindowStats,
+  UsageWindow,
   WindowStats,
   ClaudeModel,
   AccountUsageStatsResponse,
@@ -382,6 +384,12 @@ export async function getUsage(id: number, source?: 'passive' | 'active', force?
   const { data } = await apiClient.get<AccountUsageInfo>(`/admin/accounts/${id}/usage`, {
     params: Object.keys(params).length > 0 ? params : undefined
   })
+  return data
+}
+
+/** Local log statistics only; never probes upstream quota. */
+export async function getUsageModelStats(id: number, window: UsageWindow): Promise<AccountModelWindowStats> {
+  const { data } = await apiClient.get<AccountModelWindowStats>(`/admin/accounts/${id}/usage-model-stats`, { params: { window } })
   return data
 }
 
@@ -1150,6 +1158,7 @@ export const accountsAPI = {
   getStats,
   clearError,
   getUsage,
+  getUsageModelStats,
   getBatchUsage,
   getTodayStats,
   getBatchTodayStats,
