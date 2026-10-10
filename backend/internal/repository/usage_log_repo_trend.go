@@ -449,9 +449,19 @@ func (r *usageLogRepository) GetModelStatsWithUsageFiltersBySource(ctx context.C
 }
 
 func (r *usageLogRepository) getModelStatsWithFiltersBySource(ctx context.Context, startTime, endTime time.Time, userID, apiKeyID, accountID, groupID int64, model string, requestType *int16, stream *bool, billingType *int8, source string, billingMode string, upstreamModelMismatch *bool, nativeCompactionV2 *bool) (results []ModelStat, err error) {
+	return r.getModelStats(ctx, startTime, endTime, userID, apiKeyID, accountID, groupID, model, requestType, stream, billingType, source, billingMode, upstreamModelMismatch, nativeCompactionV2, true)
+}
+
+// GetAccountModelWindowStats preserves actual_cost as user cost while returning
+// account_cost separately, unlike legacy account-only dashboard statistics.
+func (r *usageLogRepository) GetAccountModelWindowStats(ctx context.Context, accountID int64, startTime, endTime time.Time) ([]ModelStat, error) {
+	return r.getModelStats(ctx, startTime, endTime, 0, 0, accountID, 0, "", nil, nil, nil, usagestats.ModelSourceUpstream, "", nil, nil, false)
+}
+
+func (r *usageLogRepository) getModelStats(ctx context.Context, startTime, endTime time.Time, userID, apiKeyID, accountID, groupID int64, model string, requestType *int16, stream *bool, billingType *int8, source string, billingMode string, upstreamModelMismatch *bool, nativeCompactionV2 *bool, accountCostAsActual bool) (results []ModelStat, err error) {
 	actualCostExpr := "COALESCE(SUM(actual_cost), 0) as actual_cost"
 	// 当仅按 account_id 聚合时，实际费用使用账号倍率（total_cost * account_rate_multiplier）。
-	if accountID > 0 && userID == 0 && apiKeyID == 0 {
+	if accountCostAsActual && accountID > 0 && userID == 0 && apiKeyID == 0 {
 		actualCostExpr = "COALESCE(SUM(COALESCE(account_stats_cost, total_cost) * COALESCE(account_rate_multiplier, 1)), 0) as actual_cost"
 	}
 	accountCostExpr := "COALESCE(SUM(COALESCE(account_stats_cost, total_cost) * COALESCE(account_rate_multiplier, 1)), 0) as account_cost"

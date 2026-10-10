@@ -54,6 +54,10 @@
         {{ displayPercent }}
       </span>
 
+      <button v-if="showDetails" type="button" class="shrink-0 rounded px-1 text-[10px] text-primary-600 hover:underline focus-visible:ring-2 focus-visible:ring-primary-500 dark:text-primary-400" :aria-label="`${label} ${t('admin.accounts.usageWindow.modelDetails')}`" @click="emit('details')">
+        {{ t('admin.accounts.usageWindow.modelDetails') }}
+      </button>
+
       <!-- Reset time -->
       <span v-if="quotaAvailable === false" class="text-[10px] text-gray-400">
         {{ t('admin.accounts.usageWindow.quotaUnknown') }}
@@ -69,7 +73,7 @@
 import { computed, ref, watch } from 'vue'
 import { useIntervalFn } from '@vueuse/core'
 import { useI18n } from 'vue-i18n'
-import type { WindowStats } from '@/types'
+import type { WindowStats, UsageWindowPeriod } from '@/types'
 import { formatCompactNumber } from '@/utils/format'
 
 const props = withDefaults(
@@ -79,7 +83,8 @@ const props = withDefaults(
     resetsAt?: string | null
     color: 'indigo' | 'emerald' | 'purple' | 'amber'
     windowStats?: WindowStats | null
-    windowStatsPeriod?: 'cycle' | 'last_7_days'
+    windowStatsPeriod?: UsageWindowPeriod
+    showDetails?: boolean
     quotaAvailable?: boolean
     estimatedTotalCost?: number | null
     showNowWhenIdle?: boolean
@@ -90,10 +95,12 @@ const props = withDefaults(
   { labelWidth: 'fixed', quotaAvailable: true }
 )
 
+const emit = defineEmits<{ details: [] }>()
+
 const { t } = useI18n()
 
 const windowStatsTooltip = computed(() => props.windowStatsPeriod
-  ? t(`admin.accounts.usageWindow.localStats${props.windowStatsPeriod === 'cycle' ? 'Cycle' : 'Last7Days'}`)
+  ? t(`admin.accounts.usageWindow.localStats${props.windowStatsPeriod === 'cycle' ? 'Cycle' : props.windowStatsPeriod === 'last_5_hours' ? 'Last5Hours' : 'Last7Days'}`)
   : undefined)
 
 // Reactive clock for countdown — only runs when a reset time is shown,

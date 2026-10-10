@@ -1373,8 +1373,29 @@ export interface WindowStats {
   user_cost?: number
 }
 
+export type UsageWindow = '5h' | '7d'
+export type UsageWindowPeriod = 'cycle' | 'last_5_hours' | 'last_7_days'
+
+export interface ModelWindowTokens {
+  input_tokens: number
+  cache_read_tokens: number
+  cache_creation_tokens: number
+  output_tokens: number
+  total_tokens: number
+}
+
+export interface AccountModelWindowStats {
+  window: UsageWindow
+  period: UsageWindowPeriod
+  start_at: string
+  end_at: string
+  model_source: 'upstream'
+  models: Array<ModelWindowTokens & { model: string; requests: number }>
+  totals: ModelWindowTokens & WindowStats
+}
+
 export interface UsageProgress {
-  window_stats_period?: 'cycle' | 'last_7_days'
+  window_stats_period?: UsageWindowPeriod
   quota_available?: boolean
   utilization: number // Percentage (0-100+, 100 = 100%)
   resets_at: string | null
