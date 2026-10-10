@@ -124,13 +124,15 @@ const (
 
 // UsageCache 封装账户使用量相关的缓存
 type UsageCache struct {
-	apiCache          sync.Map           // accountID -> *apiUsageCache
-	windowStatsCache  sync.Map           // windowStatsCacheKey -> *windowStatsCache
-	antigravityCache  sync.Map           // accountID -> *antigravityUsageCache
-	apiFlight         singleflight.Group // 防止同一账号的并发请求击穿缓存（Anthropic）
-	antigravityFlight singleflight.Group // 防止同一 Antigravity 账号的并发请求击穿缓存
-	openAIProbeCache  sync.Map           // accountID -> time.Time
-	grokProbeCache    sync.Map           // accountID -> last billing probe attempt
+	apiCache              sync.Map // accountID -> *apiUsageCache
+	windowStatsCache      sync.Map // windowStatsCacheKey -> *windowStatsCache
+	antigravityCache      sync.Map // accountID -> *antigravityUsageCache
+	modelWindowStatsCache sync.Map // windowStatsCacheKey -> *modelWindowStatsCache
+	modelWindowFlight     singleflight.Group
+	apiFlight             singleflight.Group // 防止同一账号的并发请求击穿缓存（Anthropic）
+	antigravityFlight     singleflight.Group // 防止同一 Antigravity 账号的并发请求击穿缓存
+	openAIProbeCache      sync.Map           // accountID -> time.Time
+	grokProbeCache        sync.Map           // accountID -> last billing probe attempt
 }
 
 // NewUsageCache 创建 UsageCache 实例
@@ -780,18 +782,23 @@ func (s *AccountUsageService) getOpenAIUsage(ctx context.Context, account *Accou
 		return usage, nil
 	}
 
-	if stats, err := s.usageLogRepo.GetAccountWindowStats(ctx, account.ID, codexWindowStatsStart(usage.FiveHour, 5*time.Hour, now)); err == nil {
-		if usage.FiveHour == nil {
-			usage.FiveHour = &UsageProgress{Utilization: 0}
+	for _, window := range []string{"5h", "7d"} {
+		progress := usage.FiveHour
+		if window == "7d" {
+			progress = usage.SevenDay
 		}
-		usage.FiveHour.WindowStats = windowStatsFromAccountStats(stats)
-	}
-
-	if stats, err := s.usageLogRepo.GetAccountWindowStats(ctx, account.ID, codexWindowStatsStart(usage.SevenDay, 7*24*time.Hour, now)); err == nil {
-		if usage.SevenDay == nil {
-			usage.SevenDay = &UsageProgress{Utilization: 0}
+		start, period := resolveAccountUsageWindow(account, window, progress, now)
+		if progress == nil {
+			available := false
+			progress = &UsageProgress{QuotaAvailable: &available}
 		}
-		usage.SevenDay.WindowStats = windowStatsFromAccountStats(stats)
+		progress.WindowStatsPeriod = period
+		progress.WindowStats = s.cachedWindowStats(ctx, account.ID, window, period, start, now)
+		if window == "5h" {
+			usage.FiveHour = progress
+		} else {
+			usage.SevenDay = progress
+		}
 	}
 
 	return usage, nil
@@ -1375,15 +1382,20 @@ func (s *AccountUsageService) addWindowStats(ctx context.Context, account *Accou
 }
 
 func (s *AccountUsageService) addWindowStatsAt(ctx context.Context, account *Account, usage *UsageInfo, now time.Time) {
-	if usage.FiveHour != nil && s.usageLogRepo != nil {
-		usage.FiveHour.WindowStats = s.cachedWindowStats(ctx, account.ID, "5h", "cycle", account.GetCurrentWindowStartTime(), now)
+	if usage.FiveHour == nil {
+		usage.FiveHour = &UsageProgress{}
+	}
+	fiveStart, fivePeriod := resolveAccountUsageWindow(account, "5h", usage.FiveHour, now)
+	usage.FiveHour.WindowStatsPeriod = fivePeriod
+	if s.usageLogRepo != nil {
+		usage.FiveHour.WindowStats = s.cachedWindowStats(ctx, account.ID, "5h", fivePeriod, fiveStart, now)
 	}
 
 	if usage.SevenDay == nil {
 		usage.SevenDay = buildClaudePassiveSevenDay(account.Extra)
 	}
 	weekly := usage.SevenDay
-	startTime, period := claudeSevenDayStatsStart(weekly, now)
+	startTime, period := resolveAccountUsageWindow(account, "7d", weekly, now)
 	weekly.WindowStatsPeriod = period
 	available := weekly.QuotaAvailable != nil && *weekly.QuotaAvailable
 	if weekly.ResetsAt != nil && period != "cycle" {
@@ -1397,11 +1409,7 @@ func (s *AccountUsageService) addWindowStatsAt(ctx context.Context, account *Acc
 
 // claudeSevenDayStatsStart distinguishes a known cycle from a rolling local view.
 func claudeSevenDayStatsStart(progress *UsageProgress, now time.Time) (time.Time, string) {
-	window := 7 * 24 * time.Hour
-	if progress != nil && progress.ResetsAt != nil && now.Before(*progress.ResetsAt) && !progress.ResetsAt.After(now.Add(window)) {
-		return progress.ResetsAt.Add(-window), "cycle"
-	}
-	return now.Add(-window), "last_7_days"
+	return usageWindowStart(progress, 7*24*time.Hour, "last_7_days", now)
 }
 
 func (s *AccountUsageService) cachedWindowStats(ctx context.Context, accountID int64, window, period string, startTime, now time.Time) *WindowStats {
@@ -1409,12 +1417,18 @@ func (s *AccountUsageService) cachedWindowStats(ctx context.Context, accountID i
 	if s.cache != nil {
 		if cached, ok := s.cache.windowStatsCache.Load(key); ok {
 			if entry, ok := cached.(*windowStatsCache); ok && now.Sub(entry.timestamp) < windowStatsCacheTTL && entry.period == period &&
-				(period == "last_7_days" || entry.startTime.Equal(startTime)) {
+				(period != "cycle" || entry.startTime.Equal(startTime)) {
 				return entry.stats
 			}
 		}
 	}
-	stats, err := s.usageLogRepo.GetAccountWindowStats(ctx, accountID, startTime)
+	var stats *usagestats.AccountStats
+	var err error
+	if reader, ok := s.usageLogRepo.(accountWindowRangeReader); ok {
+		stats, err = reader.GetAccountWindowStatsInRange(ctx, accountID, startTime, now)
+	} else {
+		stats, err = s.usageLogRepo.GetAccountWindowStats(ctx, accountID, startTime)
+	}
 	if err != nil {
 		log.Printf("Failed to get %s window stats for account %d: %v", window, accountID, err)
 		return nil
@@ -1578,13 +1592,6 @@ func buildCodexUsageProgressFromExtra(extra map[string]any, window string, now t
 	}
 
 	return progress
-}
-
-func codexWindowStatsStart(progress *UsageProgress, fallbackWindow time.Duration, now time.Time) time.Time {
-	if progress != nil && progress.ResetsAt != nil && now.Before(*progress.ResetsAt) {
-		return progress.ResetsAt.Add(-fallbackWindow)
-	}
-	return now.Add(-fallbackWindow)
 }
 
 func (s *AccountUsageService) GetAccountUsageStats(ctx context.Context, accountID int64, startTime, endTime time.Time) (*usagestats.AccountUsageStatsResponse, error) {

@@ -1734,3 +1734,58 @@ func (s *UsageLogRepoSuite) TestListWithFilters_CombinedFilters() {
 	s.Require().Len(logs, 2)
 	s.Require().Equal(int64(2), page.Total)
 }
+
+// TestGetAccountModelWindowStats verifies real SQL grouping and [start,end) bounds.
+func (s *UsageLogRepoSuite) TestGetAccountModelWindowStats() {
+	user := mustCreateUser(s.T(), s.client, &service.User{Email: "model-window@test.com"})
+	apiKey := mustCreateApiKey(s.T(), s.client, &service.APIKey{UserID: user.ID, Key: "sk-model-window", Name: "k"})
+	account := mustCreateAccount(s.T(), s.client, &service.Account{Name: "model-window"})
+	other := mustCreateAccount(s.T(), s.client, &service.Account{Name: "model-window-other"})
+	start := time.Date(2026, 10, 10, 1, 0, 0, 0, time.UTC)
+	end := start.Add(5 * time.Hour)
+	mapped, blank := "  claude-opus-version  ", " "
+	multiplier := 2.0
+	for _, row := range []struct {
+		accountID int64
+		at        time.Time
+		model     string
+		upstream  *string
+	}{
+		{account.ID, start, "alias", &mapped},
+		{account.ID, start.Add(time.Minute), "different-alias", &mapped},
+		{account.ID, start.Add(time.Hour), "historical-model", nil},
+		{account.ID, start.Add(2 * time.Hour), "historical-model", &blank},
+		{account.ID, start.Add(-time.Microsecond), "excluded", nil},
+		{account.ID, end, "excluded", nil},
+		{other.ID, start, "excluded", nil},
+	} {
+		_, err := s.repo.Create(s.ctx, &service.UsageLog{UserID: user.ID, APIKeyID: apiKey.ID, AccountID: row.accountID, RequestID: uuid.New().String(), Model: row.model, UpstreamModel: row.upstream, InputTokens: 10, OutputTokens: 20, CacheCreationTokens: 30, CacheReadTokens: 40, CacheCreation5mTokens: 10, CacheCreation1hTokens: 20, TotalCost: 1.5, ActualCost: 0.5, AccountRateMultiplier: &multiplier, CreatedAt: row.at})
+		s.Require().NoError(err)
+	}
+	models, err := s.repo.GetAccountModelWindowStats(s.ctx, account.ID, start, end)
+	s.Require().NoError(err)
+	s.Require().Len(models, 2)
+	byName := map[string]ModelStat{}
+	for _, m := range models {
+		byName[m.Model] = m
+	}
+	s.Require().Contains(byName, "claude-opus-version")
+	s.Require().Contains(byName, "historical-model")
+	for _, m := range models {
+		s.Require().Equal(int64(2), m.Requests)
+		s.Require().Equal(int64(20), m.InputTokens)
+		s.Require().Equal(int64(40), m.OutputTokens)
+		s.Require().Equal(int64(60), m.CacheCreationTokens)
+		s.Require().Equal(int64(80), m.CacheReadTokens)
+		s.Require().Equal(int64(200), m.TotalTokens)
+		s.Require().Equal(3.0, m.Cost)
+		s.Require().Equal(1.0, m.ActualCost)
+		s.Require().Equal(6.0, m.AccountCost)
+	}
+	totals, err := s.repo.GetAccountWindowStatsInRange(s.ctx, account.ID, start, end)
+	s.Require().NoError(err)
+	s.Require().Equal(int64(400), totals.Tokens)
+	s.Require().Equal(int64(4), totals.Requests)
+	s.Require().Equal(12.0, totals.Cost)
+	s.Require().Equal(2.0, totals.UserCost)
+}
