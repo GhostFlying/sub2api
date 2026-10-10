@@ -18,6 +18,9 @@ including Spark shadow accounts. Reuse this checkout and branch from fork.
 
 ## Validation evidence
 
+- CI follow-up: check cache and singleflight result type assertions, assert the
+  test cache entry type, rerun focused Go tests and verify the updated PR checks.
+
 - Focused service/repository/admin-handler tests pass.
 - Real PostgreSQL integration verifies grouped upstream/fallback models,
   account isolation, [start,end) bounds, four buckets and independent costs.

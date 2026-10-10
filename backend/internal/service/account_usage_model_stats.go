@@ -124,7 +124,10 @@ func (s *AccountUsageService) GetAccountModelWindowStats(ctx context.Context, ac
 			return nil
 		}
 		if value, ok := s.cache.modelWindowStatsCache.Load(key); ok {
-			entry := value.(*modelWindowStatsCache)
+			entry, valid := value.(*modelWindowStatsCache)
+			if !valid || entry == nil || entry.snapshot == nil {
+				return nil
+			}
 			if now.Sub(entry.timestamp) < windowStatsCacheTTL && entry.snapshot.Period == period && (period != "cycle" || entry.snapshot.StartAt.Equal(start)) {
 				return entry.snapshot
 			}
@@ -195,6 +198,10 @@ func (s *AccountUsageService) GetAccountModelWindowStats(ctx context.Context, ac
 		if result.Err != nil {
 			return nil, result.Err
 		}
-		return result.Val.(*AccountModelWindowStats), nil
+		snapshot, ok := result.Val.(*AccountModelWindowStats)
+		if !ok || snapshot == nil {
+			return nil, fmt.Errorf("invalid model window statistics result")
+		}
+		return snapshot, nil
 	}
 }
