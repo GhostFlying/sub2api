@@ -98,6 +98,39 @@ func (r *tokenCacheInvalidatorRecorder) InvalidateToken(ctx context.Context, acc
 }
 
 func TestRateLimitService_HandleUpstreamError_OAuth401SetsTempUnschedulable(t *testing.T) {
+	t.Run("anthropic_setup_token", func(t *testing.T) {
+		repo := &rateLimitAccountRepoStub{}
+		invalidator := &tokenCacheInvalidatorRecorder{}
+		service := NewRateLimitService(repo, nil, &config.Config{}, nil, nil)
+		service.SetTokenCacheInvalidator(invalidator)
+		account := &Account{
+			ID:       99,
+			Platform: PlatformAnthropic,
+			Type:     AccountTypeSetupToken,
+			Status:   StatusActive,
+			Credentials: map[string]any{
+				"access_token":  "current-access-token",
+				"refresh_token": "current-refresh-token",
+			},
+		}
+
+		shouldDisable := service.HandleUpstreamError(
+			context.Background(),
+			account,
+			http.StatusUnauthorized,
+			http.Header{},
+			[]byte(`{"type":"error","error":{"type":"authentication_error","message":"OAuth access token has been revoked."}}`),
+		)
+
+		require.True(t, shouldDisable)
+		require.Equal(t, 0, repo.setErrorCalls, "setup-token 401 must not permanently disable the account")
+		require.Equal(t, 1, repo.tempCalls, "setup-token 401 must enter temporary unschedulable recovery")
+		require.Equal(t, int64(99), repo.lastTempID)
+		require.Contains(t, repo.lastTempReason, "OAuth 401")
+		require.Len(t, invalidator.accounts, 1)
+		require.Equal(t, int64(99), invalidator.accounts[0].ID)
+	})
+
 	t.Run("gemini", func(t *testing.T) {
 		repo := &rateLimitAccountRepoStub{}
 		invalidator := &tokenCacheInvalidatorRecorder{}
